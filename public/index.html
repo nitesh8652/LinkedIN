@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Company Research Agent</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo-badge">AI</div>
+      <div>
+        <h1>AI Company Research Agent</h1>
+        <p>Upload an Excel of company names &rarr; get directors + LinkedIn profiles in a clean report.</p>
+      </div>
+    </header>
+
+    <!-- Upload card -->
+    <section class="card" id="uploadCard">
+      <h2>1. Upload Excel File</h2>
+      <div
+        id="dropZone"
+        class="drop-zone"
+        tabindex="0"
+        role="button"
+        aria-label="Upload Excel file"
+      >
+        <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <p><strong>Drag &amp; drop</strong> your .xlsx file here, or click to browse</p>
+        <p class="hint">The file should contain a column with company names (e.g. "Company Name").</p>
+      </div>
+      <input type="file" id="fileInput" accept=".xlsx,.xlsm" hidden />
+
+      <div id="fileInfo" class="file-info hidden">
+        <span class="file-icon">&#128196;</span>
+        <span id="fileName"></span>
+        <span id="fileSize" class="hint"></span>
+        <button id="clearFile" class="btn-ghost" title="Remove">&times;</button>
+      </div>
+
+      <button id="uploadBtn" class="btn btn-primary" disabled>
+        Upload &amp; Start Processing
+      </button>
+    </section>
+
+    <!-- Status card -->
+    <section class="card hidden" id="statusCard">
+      <h2>2. Processing Status</h2>
+
+      <div class="progress-wrap">
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-labels">
+          <span id="progressText">Waiting...</span>
+          <span id="percentText">0%</span>
+        </div>
+      </div>
+
+      <div class="current-company hidden" id="currentCompany">
+        <span class="pulse-dot"></span>
+        <span id="currentCompanyName"></span>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat">
+          <span class="stat-value" id="statCompanies">0</span>
+          <span class="stat-label">Companies</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="statPeople">0</span>
+          <span class="stat-label">People Found</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="statLinkedin">0</span>
+          <span class="stat-label">LinkedIn URLs</span>
+        </div>
+      </div>
+
+      <div class="log-box" id="logBox" aria-live="polite"></div>
+    </section>
+
+    <!-- Results card -->
+    <section class="card hidden" id="resultsCard">
+      <h2>3. Download Report</h2>
+      <div id="doneBanner" class="banner banner-success hidden">
+        Processing complete! Your Excel report is ready.
+      </div>
+      <div id="errorBanner" class="banner banner-error hidden"></div>
+
+      <div class="table-wrap">
+        <table id="resultsTable">
+          <thead>
+            <tr>
+              <th>Company Name</th>
+              <th>Person Name</th>
+              <th>Designation</th>
+              <th>LinkedIn URL</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <a id="downloadBtn" class="btn btn-primary btn-download hidden" href="#" download>
+        &#11015;&nbsp; Download Excel Report
+      </a>
+    </section>
+
+    <footer>
+      <p class="hint">
+        LLM layer: <span id="llmMode">detecting...</span> &mdash; set
+        <code>OPENAI_API_KEY</code> to enable AI-powered extraction.
+      </p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "ai-company-research-agent",
+  "version": "1.0.0",
+  "description": "AI web research agent: Excel company list -> official website -> directors -> LinkedIn -> Excel report",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "install-browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "exceljs": "^4.4.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "playwright": "^1.45.0",
+    "uuid": "^9.0.1"
+  }
+}
