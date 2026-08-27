@@ -249,7 +249,14 @@ const serperStatus = () => ({
   credits: serperCredits,
 });
 
-async function runSerper(query, num = 20) {
+// Free Serper plans reject anything above one page of results with
+// HTTP 400 "Query pattern not allowed for free accounts" — which, if left
+// unhandled, fails *every* query and silently drops the whole run back onto
+// the throttled scrapers. Ask for a page at a time and let a 400 walk the
+// request size down once before giving up.
+const SERPER_PAGE = Math.max(1, Math.min(20, Number(process.env.SERPER_NUM) || 10));
+
+async function runSerper(query, num = SERPER_PAGE, { retryOnPattern = true } = {}) {
   const res = await fetchWithTimeout(
     SERPER_ENDPOINT,
     {
@@ -268,6 +275,10 @@ async function runSerper(query, num = 20) {
     },
     20000
   );
+
+  if (res.status === 400 && retryOnPattern && num > 10) {
+    return runSerper(query, 10, { retryOnPattern: false });
+  }
 
   if (res.status === 401 || res.status === 403) {
     serperOff = true;

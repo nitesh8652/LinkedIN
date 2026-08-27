@@ -115,6 +115,10 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
         await writeResultsToExcel(rows, outPath, {
           totalCompanies: companies.length,
           llmEnabled: job.meta.llmEnabled,
+          // runAgent already worked out which backend actually served the
+          // run; without passing it through, the Summary sheet claimed
+          // "scraped engines" even on a healthy Serper key.
+          searchProvider: job.meta.searchProvider,
         });
         job.outputPath = `/api/download/${jobId}`;
         job.outputFile = outPath;

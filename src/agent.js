@@ -14,6 +14,13 @@ const { findOfficialWebsiteWithQueries } = require('./discover');
 const { crawlWebsiteForLeaders } = require('./crawler');
 const { extractLeaders } = require('./extract');
 const { findLinkedInProfile } = require('./linkedin');
+const {
+  findDirectorsOnZaubaCorp,
+  verifyDirectorOnLinkedIn,
+  closeZaubaBrowser,
+  ZAUBA_SOURCE,
+  WEBSITE_SOURCE,
+} = require('./zaubacorp');
 const { llmEnabled } = require('./llm');
 const { brandTokens } = require('./normalize');
 const {
@@ -120,14 +127,81 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;');
 }
 
+/**
+ * ZaubaCorp reports why it gave up in words; the report stores a status code.
+ * Every failure mode maps to its own code so a NULL row always explains
+ * itself rather than looking like a generic miss.
+ */
+function zaubaStatusFor(reason) {
+  const r = String(reason || '').toLowerCase();
+  if (r.includes('page not found')) return 'zauba_not_found';
+  if (r.includes('confidence too low')) return 'zauba_low_confidence';
+  if (r.includes('directors unavailable')) return 'zauba_no_directors';
+  if (r.includes('could not be loaded')) return 'zauba_unreachable';
+  return 'zauba_error';
+}
+
+/**
+ * Fallback source of last resort: the MCA registry via ZaubaCorp.
+ *
+ * Only reached when the existing pipeline found nobody at all — no official
+ * website, or a website that named no leadership. Each registry name is put
+ * through LinkedIn verification before it is allowed into the report.
+ */
+async function directorsFromZaubaCorp(companyName, log, nullRow) {
+  const zauba = await findDirectorsOnZaubaCorp(companyName, log);
+
+  if (!zauba.ok) {
+    log(`ZaubaCorp fallback failed: ${zauba.reason} -> NULL row`);
+    return nullRow(zaubaStatusFor(zauba.reason), ZAUBA_SOURCE);
+  }
+
+  log(
+    `ZaubaCorp matched "${zauba.matchedName}" (${zauba.confidence} confidence); ` +
+      `verifying ${zauba.directors.length} director(s) on LinkedIn`
+  );
+
+  const rows = [];
+  for (const person of zauba.directors.slice(0, MAX_PEOPLE_PER_COMPANY)) {
+    const designation = person.designation || 'Director';
+    log(`verifying ${person.name} (${designation}) on LinkedIn`);
+
+    let verdict = { url: null, confidence: 'none', reason: 'LinkedIn verification failed' };
+    try {
+      verdict = await verifyDirectorOnLinkedIn(person.name, companyName, designation, log);
+    } catch (err) {
+      verdict = {
+        url: null,
+        confidence: 'none',
+        reason: `LinkedIn verification failed: ${err.message}`,
+      };
+      log(`LinkedIn verification error: ${err.message}`);
+    }
+
+    let status = 'linkedin_unverified';
+    if (verdict.url) status = verdict.confidence === 'medium' ? 'ok_medium' : 'ok';
+
+    rows.push({
+      companyName,
+      personName: person.name,
+      designation,
+      linkedinUrl: verdict.url,
+      status,
+      source: ZAUBA_SOURCE,
+    });
+  }
+  return rows;
+}
+
 async function processCompany(companyName, job) {
   const log = (msg) => job.log(`[${companyName}] ${msg}`);
-  const nullRow = (status) => [{
+  const nullRow = (status, source = WEBSITE_SOURCE) => [{
     companyName,
     personName: null,
     designation: null,
     linkedinUrl: null,
     status,
+    source,
   }];
 
   try {
@@ -195,9 +269,17 @@ async function processCompany(companyName, job) {
       merge(await leadersFromWebSnippets(companyName, log));
     }
 
+    // Everything above is the existing flow, untouched. ZaubaCorp is reached
+    // only once that flow has produced nobody — either because no official
+    // website was found, or because the one that was found named no leaders.
+    // A company with valid directors never gets here.
     if (leaders.length === 0) {
-      log('directors not found -> NULL row');
-      return nullRow(website ? 'no_directors' : 'no_website');
+      log(
+        website
+          ? 'website found but no directors extracted -> ZaubaCorp fallback'
+          : 'official website not found -> ZaubaCorp fallback'
+      );
+      return directorsFromZaubaCorp(companyName, log, nullRow);
     }
 
     // Untitled names scraped off a homepage exist only to avoid an empty
@@ -237,6 +319,7 @@ async function processCompany(companyName, job) {
         designation,
         linkedinUrl: url,
         status: url ? 'ok' : 'no_linkedin',
+        source: WEBSITE_SOURCE,
       });
     }
     return rows;
@@ -288,6 +371,7 @@ async function runAgent(companies, job) {
     }
   } finally {
     await closeSearchBrowser();
+    await closeZaubaBrowser();
   }
 
   return allRows;

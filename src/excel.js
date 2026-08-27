@@ -73,13 +73,23 @@ const NULL_VALUE = 'NULL';
  */
 const STATUS_LABELS = {
   ok: 'Found',
+  ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',
+  // ZaubaCorp fallback — every way it can come up empty gets its own label.
+  linkedin_unverified: 'LinkedIn verification failed',
+  zauba_not_found: 'ZaubaCorp page not found',
+  zauba_low_confidence: 'ZaubaCorp company match confidence too low',
+  zauba_no_directors: 'ZaubaCorp directors unavailable',
+  zauba_unreachable: 'ZaubaCorp page could not be loaded',
+  zauba_error: 'ZaubaCorp lookup error',
 };
 
 const statusLabel = (s) => STATUS_LABELS[s] || (s ? String(s) : NULL_VALUE);
+
+const DEFAULT_SOURCE = 'Official Website';
 
 /**
  * Build the output workbook.
@@ -97,7 +107,8 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
     { header: 'Person Name', key: 'personName', width: 26 },
     { header: 'Designation', key: 'designation', width: 28 },
     { header: 'LinkedIn URL', key: 'linkedinUrl', width: 46 },
-    { header: 'Status', key: 'status', width: 30 },
+    { header: 'Source', key: 'source', width: 18 },
+    { header: 'Status', key: 'status', width: 34 },
   ];
 
   for (const r of rows) {
@@ -106,6 +117,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
       personName: r.personName || NULL_VALUE,
       designation: r.designation || NULL_VALUE,
       linkedinUrl: r.linkedinUrl || NULL_VALUE,
+      source: r.source || DEFAULT_SOURCE,
       status: statusLabel(r.status),
     });
   }
@@ -137,7 +149,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
   }
 
   ws.views = [{ state: 'frozen', ySplit: 1 }];
-  ws.autoFilter = { from: 'A1', to: 'E1' };
+  ws.autoFilter = { from: 'A1', to: 'F1' };
 
   // Summary sheet
   const sumWs = workbook.addWorksheet('Summary');
@@ -166,6 +178,19 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
   sumWs.addRow({});
   sumWs.addRow({ metric: 'Outcome breakdown', value: '' }).font = { bold: true };
   for (const [label, count] of [...byStatus.entries()].sort((a, b) => b[1] - a[1])) {
+    sumWs.addRow({ metric: label, value: count });
+  }
+
+  // How much of the report the official-website route carried, and how much
+  // the ZaubaCorp fallback had to rescue.
+  const bySource = new Map();
+  for (const r of withPeople) {
+    const label = r.source || DEFAULT_SOURCE;
+    bySource.set(label, (bySource.get(label) || 0) + 1);
+  }
+  sumWs.addRow({});
+  sumWs.addRow({ metric: 'People found by source', value: '' }).font = { bold: true };
+  for (const [label, count] of [...bySource.entries()].sort((a, b) => b[1] - a[1])) {
     sumWs.addRow({ metric: label, value: count });
   }
 

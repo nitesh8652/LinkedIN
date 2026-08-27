@@ -1,0 +1,772 @@
+/**
+ * ZaubaCorp fallback source.
+ *
+ * This module is only ever reached when the existing pipeline (website
+ * discovery -> crawl -> extract -> search-snippet fallbacks) produced no
+ * directors at all. It never runs alongside that flow, and nothing in
+ * crawler.js / extract.js knows it exists.
+ *
+ * It does three things, each of which can fail with a stated reason:
+ *
+ *   1. locate the company's ZaubaCorp page (web search first, ZaubaCorp's own
+ *      search endpoint second) and prove the page is about THIS company using
+ *      normalized-token similarity, not a substring test;
+ *   2. read the "Current Directors & Key Managerial Personnel" table off that
+ *      page (falling back to the prose "Directors of X are A and B" line);
+ *   3. verify each name on LinkedIn with strict name+company rules, so a
+ *      registry name is never written into the report attached to a stranger's
+ *      profile.
+ *
+ * ZaubaCorp sits behind Cloudflare and answers plain fetch with 403, so page
+ * loads go through Playwright — the same approach crawler.js already takes for
+ * company sites.
+ */
+
+require('./env');
+const { chromium } = require('playwright');
+const cheerio = require('cheerio');
+
+const { searchWithFallbackQueries } = require('./search');
+const { brandTokens } = require('./normalize');
+const { isPersonalProfileUrl, validateLinkedInCandidate } = require('./linkedin');
+const {
+  cleanName,
+  isValidPersonName,
+  looksLikeDesignation,
+  normalizeDesignation,
+  nameKey,
+  companyTokensOf,
+} = require('./person');
+
+/** Values written into the report's Source column. */
+const ZAUBA_SOURCE = 'ZaubaCorp';
+const WEBSITE_SOURCE = 'Official Website';
+
+const ZAUBA_HOST = 'www.zaubacorp.com';
+const MAX_DIRECTORS = 10;
+
+// Confidence bands for "is this ZaubaCorp page the company we asked about?"
+const MATCH_ACCEPT = 0.72;
+const MATCH_HIGH = 0.88;
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ------------------------------------------------------------------ *
+ * Company-name matching
+ *
+ * Registered names differ from the names people type in every predictable
+ * way: legal suffixes, plurals, punctuation, spelling slips. Comparing raw
+ * strings (or worse, substrings) matches "TIMES COMTRADE" to "TIMES GREEN
+ * POWER", so everything is reduced to normalized tokens first and scored.
+ * ------------------------------------------------------------------ */
+
+// Extra entity forms brandTokens() does not strip, plus registry noise.
+const EXTRA_LEGAL_TOKENS = new Set([
+  'opc', 'nidhi', 'producer', 'unlimited', 'registered', 'regd',
+]);
+
+// Tokens too common to prove two companies are the same on their own.
+const GENERIC_TOKENS = new Set([
+  'india', 'indian', 'bharat', 'international', 'global', 'national',
+  'enterprise', 'enterprises', 'industry', 'industries', 'service', 'services',
+  'solution', 'solutions', 'technology', 'technologies', 'venture', 'ventures',
+  'trading', 'trader', 'traders', 'trade', 'export', 'exports', 'import',
+  'imports', 'group', 'holding', 'holdings', 'corporation', 'company',
+  'associates', 'agency', 'agencies', 'consultancy', 'consultants',
+  'consulting', 'projects', 'infra', 'infrastructure', 'developers',
+  'builders', 'new', 'shree', 'shri', 'sri', 'the',
+]);
+
+/** "roasters" -> "roaster", "industries" -> "industry", "sons" -> "son". */
+function singularize(token) {
+  const t = String(token || '');
+  if (t.length <= 3) return t;
+  if (/[^aeiou]ies$/.test(t)) return `${t.slice(0, -3)}y`;
+  if (/(ses|xes|zes|ches|shes)$/.test(t)) return t.slice(0, -2);
+  if (/[^s]s$/.test(t)) return t.slice(0, -1);
+  return t;
+}
+
+/**
+ * Comparable token list for a company name: punctuation gone, legal entity
+ * forms gone, plurals collapsed.
+ * "Blue Tokai Coffee Roasters Private Limited" -> [blue, tokai, coffee, roaster]
+ */
+function normalizedTokens(rawName) {
+  return brandTokens(rawName)
+    .map((t) => t.replace(/[^a-z0-9]/g, ''))
+    .filter((t) => t && !EXTRA_LEGAL_TOKENS.has(t))
+    .map(singularize)
+    .filter(Boolean);
+}
+
+/** Classic Levenshtein, with an early exit on hopeless pairs. */
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > 3) return 99;
+  const prev = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(
+        prev[j] + 1,
+        prev[j - 1] + 1,
+        diag + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+/** Same word allowing for a spelling slip or a shortened form. */
+function tokensMatch(a, b) {
+  if (a === b) return true;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length >= 5 && longer.startsWith(shorter)) return true;
+  const budget = longer.length <= 5 ? 1 : 2;
+  return levenshtein(a, b) <= budget;
+}
+
+/**
+ * How confident are we that `candidateName` names the same company as
+ * `inputName`? Returns 0..1. Coverage (is all of the input explained?)
+ * dominates, with precision (is the candidate free of unexplained extra
+ * words?) as the check that stops a short name matching a longer, different
+ * one.
+ */
+function companyNameSimilarity(inputName, candidateName) {
+  const a = [...new Set(normalizedTokens(inputName))];
+  const b = [...new Set(normalizedTokens(candidateName))];
+  if (!a.length || !b.length) return { score: 0, distinctive: false };
+
+  const usedB = new Set();
+  let matched = 0;
+  let distinctive = false;
+
+  for (const ta of a) {
+    const hitIndex = b.findIndex((tb, i) => !usedB.has(i) && tokensMatch(ta, tb));
+    if (hitIndex === -1) continue;
+    usedB.add(hitIndex);
+    matched++;
+    // A shared "india" or "services" proves nothing; a shared "comtrade" does.
+    if (ta.length >= 4 && !GENERIC_TOKENS.has(ta)) distinctive = true;
+  }
+
+  const coverage = matched / a.length;
+  const precision = matched / b.length;
+  return { score: 0.65 * coverage + 0.35 * precision, distinctive };
+}
+
+/**
+ * Decide whether a ZaubaCorp result is the company we want.
+ * Returns { accepted, score, confidence, reason }.
+ */
+function matchCompanyName(inputName, candidateName) {
+  const { score, distinctive } = companyNameSimilarity(inputName, candidateName);
+  const rounded = Math.round(score * 100) / 100;
+
+  if (!distinctive) {
+    return {
+      accepted: false,
+      score: rounded,
+      confidence: 'low',
+      reason: 'no distinctive company word in common',
+    };
+  }
+  if (score < MATCH_ACCEPT) {
+    return {
+      accepted: false,
+      score: rounded,
+      confidence: 'low',
+      reason: `name similarity ${rounded} below ${MATCH_ACCEPT}`,
+    };
+  }
+  return {
+    accepted: true,
+    score: rounded,
+    confidence: score >= MATCH_HIGH ? 'high' : 'medium',
+    reason: '',
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * ZaubaCorp URLs
+ * ------------------------------------------------------------------ */
+
+// /COMPANY-NAME-<CIN>, e.g. /TIMES-COMTRADE-PRIVATE-LIMITED-U34100GJ2006PTC049120
+const COMPANY_PATH_RE = /^\/([A-Za-z0-9&'.\-%]+)-([A-Za-z][A-Za-z0-9-]{7,30})\/?$/;
+
+/** A ZaubaCorp *company* page (not a director page, not a listing page). */
+function parseCompanyUrl(rawUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (u.hostname.replace(/^www\./i, '').toLowerCase() !== 'zaubacorp.com') return null;
+
+  const m = u.pathname.match(COMPANY_PATH_RE);
+  if (!m) return null;
+
+  const slug = decodeURIComponent(m[1]);
+  const id = m[2];
+  // A CIN is a letter followed by digits and letters (U34100GJ2006PTC049120);
+  // an LLPIN looks like AAK-7453. Director pages end in a bare 8-digit DIN,
+  // which this rejects because it has no leading letter.
+  if (!/^[A-Za-z]\d{5}[A-Za-z]{2}\d{4}[A-Za-z]{3}\d{6}$/.test(id) &&
+      !/^[A-Za-z]{3}-?\d{4}$/.test(id)) {
+    return null;
+  }
+
+  // The search layer lowercases every URL it returns; ZaubaCorp's canonical
+  // slugs are upper case. It redirects either way, but asking for the
+  // canonical form avoids a redirect hop on every single lookup.
+  const canonical = `https://${ZAUBA_HOST}/${slug.toUpperCase()}-${id.toUpperCase()}`;
+  return {
+    url: canonical,
+    cin: id.toUpperCase(),
+    nameFromSlug: slug.replace(/-+/g, ' ').replace(/\s+/g, ' ').trim(),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Page fetching (Cloudflare-aware, one shared browser per run)
+ * ------------------------------------------------------------------ */
+
+let browserPromise = null;
+let zaubaPage = null;
+
+async function getZaubaPage() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+    });
+  }
+  const browser = await browserPromise;
+  if (zaubaPage && !zaubaPage.isClosed()) return zaubaPage;
+
+  const context = await browser.newContext({
+    userAgent: UA,
+    locale: 'en-US',
+    timezoneId: 'Asia/Kolkata',
+    viewport: { width: 1366, height: 900 },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = { runtime: {} };
+  });
+  zaubaPage = await context.newPage();
+  await zaubaPage.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'media', 'font', 'stylesheet'].includes(type)) return route.abort();
+    return route.continue();
+  });
+  return zaubaPage;
+}
+
+/** Release the ZaubaCorp browser (called once a job finishes). */
+async function closeZaubaBrowser() {
+  try {
+    if (browserPromise) {
+      const b = await browserPromise;
+      await b.close();
+    }
+  } catch { /* already gone */ }
+  browserPromise = null;
+  zaubaPage = null;
+}
+
+const CHALLENGE_RE =
+  /(performing security verification|checking your browser|just a moment|attention required|verify you are (a )?human|enable javascript and cookies)/i;
+
+/**
+ * Load a ZaubaCorp URL and return its HTML, or null with the reason logged.
+ * Cloudflare serves an interstitial that resolves itself after a few seconds,
+ * so a challenge is retried rather than treated as a dead end.
+ */
+async function loadZaubaHtml(url, log, { attempts = 3 } = {}) {
+  const page = await getZaubaPage();
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      const status = resp ? resp.status() : 0;
+      await page.waitForTimeout(1500 + Math.random() * 1200);
+
+      const text = await page
+        .evaluate(() => (document.body ? document.body.innerText : ''))
+        .catch(() => '');
+
+      if (CHALLENGE_RE.test(text) || (status === 403 && text.length < 4000)) {
+        log(`    ZaubaCorp challenge on attempt ${attempt}/${attempts} (HTTP ${status})`);
+        await sleep(4000 + attempt * 2500);
+        continue;
+      }
+      if (status >= 400 && status !== 403) {
+        log(`    ZaubaCorp returned HTTP ${status}`);
+        return null;
+      }
+      return await page.content();
+    } catch (err) {
+      log(`    ZaubaCorp load failed (attempt ${attempt}): ${err.message}`);
+      await sleep(2000 * attempt);
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Finding the right ZaubaCorp page
+ * ------------------------------------------------------------------ */
+
+/**
+ * Candidates from ordinary web search, through the existing search.js
+ * relevance filtering. The result TITLE is the registered company name on
+ * ZaubaCorp, so most matching is settled without spending a page load.
+ */
+async function searchZaubaCandidates(companyName, log) {
+  const brand = brandTokens(companyName).join(' ') || companyName;
+  const results = await searchWithFallbackQueries(
+    () => [
+      `site:zaubacorp.com "${companyName}"`,
+      `site:zaubacorp.com "${brand}"`,
+      `zaubacorp "${companyName}" directors`,
+      `zaubacorp ${brand} company directors`,
+    ],
+    {
+      accept: (r) => Boolean(parseCompanyUrl(r.url)),
+      minAccepted: 3,
+      log,
+    }
+  );
+
+  const out = [];
+  const seen = new Set();
+  for (const r of results) {
+    const parsed = parseCompanyUrl(r.url);
+    if (!parsed || seen.has(parsed.cin)) continue;
+    seen.add(parsed.cin);
+    // Prefer the title (the registered name as ZaubaCorp prints it); the slug
+    // says the same thing and covers results whose title got mangled.
+    const title = String(r.title || '').replace(/\s*[|-]\s*Zauba.*$/i, '').trim();
+    out.push({
+      ...parsed,
+      candidateName: title.length >= 4 ? title : parsed.nameFromSlug,
+      altName: parsed.nameFromSlug,
+    });
+  }
+  return out;
+}
+
+/**
+ * ZaubaCorp's own company search. Used only when web search produced nothing
+ * usable — it is aggressively rate limited, so it is a second chance rather
+ * than the primary route.
+ */
+async function searchZaubaDirectly(companyName, log) {
+  const slug = (brandTokens(companyName).join(' ') || companyName)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  if (!slug) return [];
+
+  const url = `https://${ZAUBA_HOST}/companysearchresults/${slug}`;
+  log(`    trying ZaubaCorp site search: ${url}`);
+  const html = await loadZaubaHtml(url, log, { attempts: 2 });
+  if (!html) {
+    log('    ZaubaCorp site search unavailable (blocked or empty)');
+    return [];
+  }
+
+  const $ = cheerio.load(html);
+  const out = [];
+  const seen = new Set();
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    let abs;
+    try {
+      abs = new URL(href, `https://${ZAUBA_HOST}/`).toString();
+    } catch {
+      return;
+    }
+    const parsed = parseCompanyUrl(abs);
+    if (!parsed || seen.has(parsed.cin)) return;
+    seen.add(parsed.cin);
+    const text = ($(el).text() || '').replace(/\s+/g, ' ').trim();
+    out.push({
+      ...parsed,
+      candidateName: text.length >= 4 ? text : parsed.nameFromSlug,
+      altName: parsed.nameFromSlug,
+    });
+  });
+  return out;
+}
+
+/** Best-scoring candidate that clears the confidence bar, or null. */
+function pickBestCandidate(companyName, candidates, log) {
+  let best = null;
+  for (const c of candidates) {
+    // Score both the printed name and the slug-derived name; a mangled title
+    // should not sink a page whose URL says exactly the right thing.
+    const byName = matchCompanyName(companyName, c.candidateName);
+    const bySlug = matchCompanyName(companyName, c.altName || '');
+    const chosen = bySlug.score > byName.score ? bySlug : byName;
+    log(`    candidate: ${c.candidateName} (score ${chosen.score}, ${chosen.confidence})`);
+    if (!chosen.accepted) continue;
+    if (!best || chosen.score > best.match.score) best = { ...c, match: chosen };
+  }
+  return best;
+}
+
+/* ------------------------------------------------------------------ *
+ * Reading directors off a company page
+ * ------------------------------------------------------------------ */
+
+/** Title-case a registry designation, keeping it a designation. */
+function tidyZaubaDesignation(raw) {
+  const text = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 60) return 'Director';
+  if (!looksLikeDesignation(text)) return 'Director';
+  // ZaubaCorp's cell is already a clean canonical label ("Additional
+  // Director", "Whole-time director"), so only the casing needs fixing.
+  const cased = text
+    .toLowerCase()
+    .replace(/(^|[\s\-/&])([a-z])/g, (_, sep, ch) => sep + ch.toUpperCase());
+  return normalizeDesignation(cased) || cased;
+}
+
+/**
+ * Header cells of a table, lowercased. Used to tell the three lookalike
+ * tables on a ZaubaCorp page apart:
+ *   Current / Past directors -> DIN | Director Name | Designation | ...
+ *   Other directorships      -> Company Name | CIN | Designation | ...
+ */
+function tableHeaders($, table) {
+  const cells = [];
+  $(table)
+    .find('thead th, thead td')
+    .each((_, th) => cells.push(($(th).text() || '').replace(/\s+/g, ' ').trim().toLowerCase()));
+  if (cells.length) return cells;
+  $(table)
+    .find('tr')
+    .first()
+    .find('th, td')
+    .each((_, th) => cells.push(($(th).text() || '').replace(/\s+/g, ' ').trim().toLowerCase()));
+  return cells;
+}
+
+/** Nearest heading text above a table — tells "Current" from "Past". */
+function headingAbove($, table) {
+  let node = $(table);
+  for (let hops = 0; hops < 6 && node.length; hops++) {
+    const prev = node.prevAll('h1,h2,h3,h4,h5,h6,p,strong,b').first();
+    if (prev.length) return (prev.text() || '').replace(/\s+/g, ' ').trim();
+    node = node.parent();
+  }
+  return '';
+}
+
+/**
+ * Extract directors from a ZaubaCorp company page.
+ * Returns [{ name, designation, din, source }] — current appointments only.
+ */
+function parseDirectorsFromHtml(html, companyName = '') {
+  const $ = cheerio.load(html);
+  const companyTokens = companyTokensOf(companyName);
+  const found = new Map();
+
+  const push = (rawName, rawDesignation, din) => {
+    const name = cleanName(String(rawName || '').replace(/\s+/g, ' ').trim());
+    if (!isValidPersonName(name, { companyTokens })) return;
+    const key = nameKey(name);
+    if (!key || found.has(key)) return;
+    found.set(key, {
+      name,
+      designation: tidyZaubaDesignation(rawDesignation),
+      din: din || null,
+      source: ZAUBA_SOURCE,
+    });
+  };
+
+  $('table').each((_, table) => {
+    if (found.size >= MAX_DIRECTORS) return false;
+
+    const headers = tableHeaders($, table);
+    const headerLine = headers.join(' | ');
+    // "Other Directorships of <person>" lists companies, not people.
+    if (headerLine.includes('company name') || headerLine.includes('cin')) return undefined;
+
+    const nameCol = headers.findIndex((h) => /director name|^name$|dp name|partner name/.test(h));
+    if (nameCol === -1) return undefined;
+    const desigCol = headers.findIndex((h) => /designation|role/.test(h));
+    const dinCol = headers.findIndex((h) => /^din|dpin/.test(h));
+    const cessationCol = headers.findIndex((h) => /cessation|resign/.test(h));
+
+    // Past appointments sit in their own table under a "Past ..." heading and
+    // also carry a cessation column. Either signal is enough to skip it.
+    const heading = headingAbove($, table).toLowerCase();
+    if (/\bpast\b|\bformer\b|\bresigned\b/.test(heading)) return undefined;
+
+    $(table)
+      .find('tbody tr')
+      .each((_, tr) => {
+        if (found.size >= MAX_DIRECTORS) return false;
+        const cells = $(tr)
+          .find('td')
+          .toArray()
+          .map((td) => ($(td).text() || '').replace(/\s+/g, ' ').trim());
+        if (!cells.length || nameCol >= cells.length) return undefined;
+        // A filled cessation date means the person has already left.
+        if (cessationCol !== -1 && cessationCol < cells.length) {
+          const ceased = cells[cessationCol];
+          if (ceased && ceased !== '-' && !/ongoing/i.test(ceased)) return undefined;
+        }
+        push(
+          cells[nameCol],
+          desigCol !== -1 && desigCol < cells.length ? cells[desigCol] : '',
+          dinCol !== -1 && dinCol < cells.length ? cells[dinCol] : ''
+        );
+        return undefined;
+      });
+    return undefined;
+  });
+
+  if (found.size) return [...found.values()];
+
+  // Fallback: the summary paragraph, which survives layout changes.
+  // "Directors of TIMES COMTRADE PRIVATE LIMITED are JITENDRA ... and DILIP ..."
+  const bodyText = $('body').text().replace(/\s+/g, ' ');
+  const m = bodyText.match(/Directors?\s+of\s+.{0,120}?\s+(?:are|is)\s+([^.]{4,400})\./i);
+  if (m) {
+    for (const part of m[1].split(/,|\band\b|&/i)) {
+      push(part, 'Director', '');
+      if (found.size >= MAX_DIRECTORS) break;
+    }
+  }
+  return [...found.values()];
+}
+
+/* ------------------------------------------------------------------ *
+ * Public entry point: directors from ZaubaCorp
+ * ------------------------------------------------------------------ */
+
+/**
+ * Look the company up on ZaubaCorp and return its current directors.
+ *
+ * Never throws. Always returns
+ *   { ok, directors, pageUrl, matchedName, confidence, reason }
+ * where `reason` states exactly why nothing came back:
+ *   'ZaubaCorp page not found' | 'Company match confidence too low'
+ *   | 'Directors unavailable' | 'ZaubaCorp page could not be loaded'
+ */
+async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
+  const fail = (reason, extra = {}) => ({
+    ok: false,
+    directors: [],
+    pageUrl: null,
+    matchedName: null,
+    confidence: 'none',
+    reason,
+    ...extra,
+  });
+
+  try {
+    log('ZaubaCorp fallback: searching company registry...');
+
+    const candidates = await searchZaubaCandidates(companyName, log);
+    log(`  ${candidates.length} ZaubaCorp page candidate(s) from web search`);
+
+    let best = pickBestCandidate(companyName, candidates, log);
+    let anyCandidate = candidates.length > 0;
+
+    if (!best) {
+      const direct = await searchZaubaDirectly(companyName, log);
+      if (direct.length) {
+        log(`  ${direct.length} candidate(s) from ZaubaCorp site search`);
+        anyCandidate = true;
+        best = pickBestCandidate(companyName, direct, log);
+      }
+    }
+
+    if (!best) {
+      return fail(anyCandidate ? 'Company match confidence too low' : 'ZaubaCorp page not found');
+    }
+
+    log(
+      `  matched "${best.candidateName}" (${best.match.confidence} confidence, ` +
+        `score ${best.match.score}) -> ${best.url}`
+    );
+
+    const html = await loadZaubaHtml(best.url, log);
+    if (!html) {
+      return fail('ZaubaCorp page could not be loaded', {
+        pageUrl: best.url,
+        matchedName: best.candidateName,
+        confidence: best.match.confidence,
+      });
+    }
+
+    const directors = parseDirectorsFromHtml(html, companyName);
+    if (!directors.length) {
+      return fail('Directors unavailable', {
+        pageUrl: best.url,
+        matchedName: best.candidateName,
+        confidence: best.match.confidence,
+      });
+    }
+
+    log(`  ZaubaCorp listed ${directors.length} current director(s)`);
+    return {
+      ok: true,
+      directors: directors.map((d) => ({ ...d, companyName })),
+      pageUrl: best.url,
+      matchedName: best.candidateName,
+      confidence: best.match.confidence,
+      reason: '',
+    };
+  } catch (err) {
+    return fail(`ZaubaCorp lookup error: ${err.message}`);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * LinkedIn verification for ZaubaCorp names
+ *
+ * Registry names are authoritative about the company but say nothing about
+ * which "Jitendra Shah" on LinkedIn is the right one, so the bar here is
+ * deliberately higher than the generic lookup: the employer must show up in
+ * the evidence, or the profile is rejected.
+ * ------------------------------------------------------------------ */
+
+const LINKEDIN_MATCH_THRESHOLD = 10;
+
+/** Company evidence in a result, split by where it was found. */
+function companyEvidence(result, companyName) {
+  const tokens = [
+    ...new Set([...companyTokensOf(companyName), ...brandTokens(companyName)]),
+  ].filter((t) => t.length >= 3);
+  if (!tokens.length) return { inTitle: false, inSnippet: false, tokens };
+
+  const tight = (s) => s.replace(/[^a-z0-9]/g, '');
+  const title = `${String(result.title || '')} ${String(result.url || '')}`.toLowerCase();
+  const snippet = String(result.snippet || '').toLowerCase();
+
+  return {
+    tokens,
+    inTitle: tokens.some((t) => title.includes(t) || tight(title).includes(t)),
+    inSnippet: tokens.some((t) => snippet.includes(t) || tight(snippet).includes(t)),
+  };
+}
+
+/**
+ * Verify one ZaubaCorp director on LinkedIn.
+ *
+ * Returns { url, confidence, reason }:
+ *   high   - name matches AND the company is in the profile title / URL
+ *   medium - name matches AND the company appears in the surrounding profile
+ *            information (snippet)
+ *   none   - no result proved BOTH the person and the employer
+ */
+async function verifyDirectorOnLinkedIn(personName, companyName, designation, log = () => {}) {
+  const brand = brandTokens(companyName).join(' ') || companyName;
+  const role = designation || 'Director';
+
+  // Company + person first (the query a human types), then the site:-scoped
+  // and role-qualified variations.
+  const queries = [
+    `site:linkedin.com/in "${personName}" "${brand}"`,
+    `"${companyName}" "${personName}" LinkedIn`,
+    `"${companyName}" "${personName}" ${role} LinkedIn`,
+    `"${personName}" "${brand}" ${role} LinkedIn`,
+    `"${personName}" Managing Director "${brand}"`,
+    `site:linkedin.com/in "${personName}" ${brand}`,
+  ];
+
+  const accept = (r) => {
+    if (!isPersonalProfileUrl(r.url)) return false;
+    if (validateLinkedInCandidate(r.url, r.title, personName, companyName) < LINKEDIN_MATCH_THRESHOLD) {
+      return false;
+    }
+    const evidence = companyEvidence(r, companyName);
+    return evidence.inTitle || evidence.inSnippet;
+  };
+
+  const results = await searchWithFallbackQueries(() => queries, {
+    accept,
+    minAccepted: 1,
+    log,
+  });
+
+  const profiles = results.filter((r) => isPersonalProfileUrl(r.url));
+  log(`    ${results.length} result(s), ${profiles.length} personal profile(s)`);
+  if (!profiles.length) {
+    return {
+      url: null,
+      confidence: 'none',
+      reason: 'LinkedIn verification failed: no profile in results',
+    };
+  }
+
+  const scored = profiles
+    .map((r) => ({
+      ...r,
+      score: validateLinkedInCandidate(r.url, r.title, personName, companyName),
+      evidence: companyEvidence(r, companyName),
+    }))
+    // Title evidence outranks snippet evidence at equal name confidence.
+    .sort(
+      (a, b) => Number(b.evidence.inTitle) - Number(a.evidence.inTitle) || b.score - a.score
+    );
+
+  for (const cand of scored) {
+    if (cand.score < LINKEDIN_MATCH_THRESHOLD) continue;
+    if (cand.evidence.inTitle) {
+      log(`    verified (high, score ${cand.score}): ${cand.url}`);
+      return { url: cand.url, confidence: 'high', reason: '' };
+    }
+    if (cand.evidence.inSnippet) {
+      log(`    verified (medium, score ${cand.score}): ${cand.url}`);
+      return { url: cand.url, confidence: 'medium', reason: '' };
+    }
+  }
+
+  // Something scored on the name alone but nothing tied it to this company —
+  // exactly the "different person, same name" case the report must not carry.
+  const bestName = scored[0];
+  const why =
+    bestName && bestName.score >= LINKEDIN_MATCH_THRESHOLD
+      ? 'LinkedIn verification failed: name matched but company did not'
+      : 'LinkedIn verification failed: no confident name match';
+  log(`    ${why}`);
+  return { url: null, confidence: 'none', reason: why };
+}
+
+module.exports = {
+  ZAUBA_SOURCE,
+  WEBSITE_SOURCE,
+  findDirectorsOnZaubaCorp,
+  verifyDirectorOnLinkedIn,
+  closeZaubaBrowser,
+  // exported for tests / reuse
+  matchCompanyName,
+  companyNameSimilarity,
+  normalizedTokens,
+  parseCompanyUrl,
+  parseDirectorsFromHtml,
+  tidyZaubaDesignation,
+};

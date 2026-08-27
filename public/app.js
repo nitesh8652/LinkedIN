@@ -224,11 +224,21 @@ const NULL_VALUE = 'NULL';
 // Mirrors STATUS_LABELS in src/excel.js — why a row came back the way it did.
 const STATUS_LABELS = {
   ok: 'Found',
+  ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',
+  // ZaubaCorp fallback — every way it can come up empty gets its own label.
+  linkedin_unverified: 'LinkedIn verification failed',
+  zauba_not_found: 'ZaubaCorp page not found',
+  zauba_low_confidence: 'ZaubaCorp company match confidence too low',
+  zauba_no_directors: 'ZaubaCorp directors unavailable',
+  zauba_unreachable: 'ZaubaCorp page could not be loaded',
+  zauba_error: 'ZaubaCorp lookup error',
 };
+
+const DEFAULT_SOURCE = 'Official Website';
 
 function addResultRow(row) {
   const tr = document.createElement('tr');
@@ -254,6 +264,7 @@ function addResultRow(row) {
     td.className = 'null';
   }
   tr.appendChild(td);
+  tr.appendChild(makeCell(row.source || DEFAULT_SOURCE));
   tr.appendChild(makeCell(STATUS_LABELS[row.status] || row.status || ''));
 
   resultsTableBody.appendChild(tr);
