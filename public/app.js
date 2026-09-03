@@ -307,3 +307,69 @@ function appendLog(line) {
 function scrollLog() {
   logBox.scrollTop = logBox.scrollHeight;
 }
+
+// ---------- Serper API key status toast ----------
+let activeToast = null;
+
+function showToast(text, ok) {
+  if (typeof Toastify !== 'function') {
+    console[ok ? 'log' : 'warn'](text);
+    return;
+  }
+  // Never stack: drop whatever is on screen before showing the new one.
+  if (activeToast) {
+    try { activeToast.hideToast(); } catch { /* already gone */ }
+  }
+  activeToast = Toastify({
+    text,
+    duration: ok ? 5000 : 8000,
+    close: true,
+    gravity: 'top',
+    position: 'right',
+    stopOnFocus: true,
+    style: {
+      background: ok
+        ? 'linear-gradient(to right, #16a34a, #22c55e)'
+        : 'linear-gradient(to right, #dc2626, #ef4444)',
+    },
+  });
+  activeToast.showToast();
+}
+
+let serperChecked = false;
+
+async function checkSerperKey() {
+  if (serperChecked) return; // guard against a double invocation
+  serperChecked = true;
+  try {
+    const res = await fetch('/api/serper-check', {
+      headers: { Accept: 'application/json' },
+    });
+
+    // A stale server without this route answers with an HTML 404 page, which
+    // blows up res.json() with "Unexpected token '<'". Detect that and say
+    // something useful instead.
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      showToast(
+        '⚠️ Serper check endpoint not found — restart the server to pick up /api/serper-check',
+        false
+      );
+      return;
+    }
+
+    const data = await res.json();
+    if (data.ok) {
+      const credits = data.credits != null ? ` — ${data.credits} credits left` : '';
+      showToast(`✅ Serper API key is working${credits}`, true);
+    } else if (data.configured) {
+      showToast(`❌ Serper API key not working: ${data.error || 'rejected'}`, false);
+    } else {
+      showToast('⚠️ No Serper API key configured — falling back to scraped engines', false);
+    }
+  } catch (err) {
+    showToast(`❌ Could not verify Serper API key: ${err.message}`, false);
+  }
+}
+
+checkSerperKey();

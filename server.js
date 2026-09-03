@@ -11,6 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 
 const { readCompaniesFromExcel, writeResultsToExcel } = require('./src/excel');
 const { runAgent } = require('./src/agent');
+const { verifySerperKey } = require('./src/search');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -136,6 +137,25 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
     res.json({ jobId, companiesFound: companies.length, companies: companies.slice(0, 50) });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// Lightweight probe the frontend calls on load to toast whether the Serper
+// key is usable. Cached briefly so repeated page loads don't each burn a
+// Serper credit.
+let serperCheckCache = null; // { at: number, result: object }
+const SERPER_CHECK_TTL = 5 * 60 * 1000;
+
+app.get('/api/serper-check', async (req, res) => {
+  try {
+    if (serperCheckCache && Date.now() - serperCheckCache.at < SERPER_CHECK_TTL) {
+      return res.json({ ...serperCheckCache.result, cached: true });
+    }
+    const result = await verifySerperKey();
+    serperCheckCache = { at: Date.now(), result };
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ configured: true, ok: false, error: err.message });
   }
 });
 
