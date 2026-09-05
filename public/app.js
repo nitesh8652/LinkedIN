@@ -21,6 +21,9 @@ const statPeople = document.getElementById('statPeople');
 const statLinkedin = document.getElementById('statLinkedin');
 const doneBanner = document.getElementById('doneBanner');
 const errorBanner = document.getElementById('errorBanner');
+const cancelBanner = document.getElementById('cancelBanner');
+const cancelBtn = document.getElementById('cancelBtn');
+const cancelHint = document.getElementById('cancelHint');
 const downloadBtn = document.getElementById('downloadBtn');
 const resultsTableBody = document.querySelector('#resultsTable tbody');
 
@@ -121,7 +124,9 @@ uploadBtn.addEventListener('click', async () => {
     resultsCard.classList.remove('hidden');
     doneBanner.classList.add('hidden');
     errorBanner.classList.add('hidden');
+    cancelBanner.classList.add('hidden');
     downloadBtn.classList.add('hidden');
+    showCancel(true);
     logBox.innerHTML = '';
     resultsTableBody.innerHTML = '';
     statPeople.textContent = '0';
@@ -136,6 +141,35 @@ uploadBtn.addEventListener('click', async () => {
   } finally {
     uploadBtn.disabled = false;
     uploadBtn.textContent = 'Upload & Start Processing';
+  }
+});
+
+// ---------- Cancel ----------
+function showCancel(visible, { pending = false } = {}) {
+  cancelBtn.classList.toggle('hidden', !visible);
+  cancelHint.classList.toggle('hidden', !visible);
+  cancelBtn.disabled = pending;
+  cancelBtn.textContent = pending ? 'Cancelling...' : 'Cancel Processing';
+}
+
+cancelBtn.addEventListener('click', async () => {
+  if (!jobId || cancelBtn.disabled) return;
+  const id = jobId;
+  showCancel(true, { pending: true });
+  try {
+    const res = await fetch(`/api/cancel/${id}`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not cancel the run');
+    if (id !== jobId) return;
+    appendLog(`[client] ${data.message}`);
+    showToast(data.message, data.ok);
+    // A job that already finished leaves nothing to cancel; its terminal
+    // state event hides the button on its own.
+    if (!data.ok) showCancel(false);
+  } catch (err) {
+    if (id !== jobId) return;
+    showCancel(true);
+    showToast(`Cancel failed: ${err.message}`, false);
   }
 });
 
@@ -239,8 +273,16 @@ function handleState(state) {
       ? `Processing companies... (${state.rowsCount} result rows so far)`
       : 'Processing companies...';
   }
-  if (state.status === 'finalizing') progressText.textContent = 'All companies fetched. Preparing report...';
-  if (state.status === 'done') {
+  if (state.status === 'cancelling') {
+    progressText.textContent = 'Cancelling... finishing the company in progress.';
+    showCancel(true, { pending: true });
+  }
+  if (state.status === 'finalizing') {
+    progressText.textContent = state.cancelled
+      ? 'Cancelled. Preparing a report of the results so far...'
+      : 'All companies fetched. Preparing report...';
+  }
+  if (state.status === 'done' || state.status === 'cancelled') {
     finishJob(null, state);
   } else if (state.status === 'error') {
     finishJob(state.error || 'Unknown server error', state);
@@ -250,21 +292,34 @@ function handleState(state) {
 function finishJob(errMsg, state) {
   stopJobUpdates();
   currentCompanyBox.classList.add('hidden');
+  showCancel(false);
 
   if (errMsg) {
     errorBanner.textContent = `Processing failed: ${errMsg}`;
     errorBanner.classList.remove('hidden');
     doneBanner.classList.add('hidden');
+    cancelBanner.classList.add('hidden');
     progressText.textContent = 'Failed.';
     return;
   }
-  percentText.textContent = '100%';
-  progressFill.style.width = '100%';
-  doneBanner.classList.remove('hidden');
+  const cancelled = state.status === 'cancelled';
+  if (cancelled) {
+    const rows = state.rowsCount || 0;
+    cancelBanner.textContent = `Processing cancelled. ${rows} result row(s) were collected${state.hasOutput ? ' and are ready to download' : ''}.`;
+    cancelBanner.classList.remove('hidden');
+    doneBanner.classList.add('hidden');
+    progressText.textContent = 'Cancelled.';
+  } else {
+    percentText.textContent = '100%';
+    progressFill.style.width = '100%';
+    doneBanner.classList.remove('hidden');
+    cancelBanner.classList.add('hidden');
+    progressText.textContent = 'Complete!';
+  }
   errorBanner.classList.add('hidden');
-  progressText.textContent = 'Complete!';
   if (state.hasOutput) {
     downloadBtn.href = `/api/download/${jobId}`;
+    downloadBtn.textContent = cancelled ? '⬇  Download Partial Report' : '⬇  Download Excel Report';
     downloadBtn.classList.remove('hidden');
   }
 }
@@ -332,7 +387,7 @@ function addResultRow(row) {
   }
   tr.appendChild(td);
   const sourceCell = makeCell(row.source || DEFAULT_SOURCE);
-  if (row.source === 'ZaubaCorp' && row.sourceUrl) {
+  if (row.source?.startsWith('ZaubaCorp') && row.sourceUrl) {
     const sourceLink = document.createElement('a');
     sourceLink.href = row.sourceUrl;
     sourceLink.target = '_blank';

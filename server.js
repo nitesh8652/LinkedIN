@@ -40,7 +40,8 @@ const jobs = new Map();
 function createJob(jobId) {
   const job = {
     id: jobId,
-    status: 'queued', // queued | running | finalizing | done | error
+    // queued | running | cancelling | finalizing | done | error | cancelled
+    status: 'queued',
     logs: [],
     rows: [],
     progress: { current: 0, completed: 0, total: 0, company: null },
@@ -49,6 +50,11 @@ function createJob(jobId) {
     outputPath: null,
     createdAt: Date.now(),
     listeners: new Set(),
+    // Cancellation is cooperative: the flag is set here and the agent stops at
+    // its next clean boundary, so the rows already collected still make it
+    // into a report.
+    cancelled: false,
+    cancelWaiters: new Set(),
     log(msg) {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
       this.logs.push(line);
@@ -67,6 +73,32 @@ function createJob(jobId) {
     onRow(row) {
       this.rows.push(row);
       this.broadcast({ type: 'row', row });
+    },
+    /** Ask the run to stop. Returns false once the job can no longer be stopped. */
+    cancel() {
+      if (this.cancelled) return false;
+      if (['done', 'error', 'cancelled'].includes(this.status)) return false;
+      this.cancelled = true;
+      this.status = 'cancelling';
+      this.log('CANCEL requested - finishing the current company, then stopping');
+      for (const waiter of this.cancelWaiters) {
+        try { waiter(); } catch { /* a waiter that already resolved */ }
+      }
+      this.cancelWaiters.clear();
+      this.broadcast({ type: 'state', state: this.snapshot() });
+      return true;
+    },
+    /**
+     * Let the agent shorten a wait it is already sitting in. Returns a
+     * disposer so a wait that ends normally unregisters itself.
+     */
+    onCancel(fn) {
+      if (this.cancelled) {
+        fn();
+        return null;
+      }
+      this.cancelWaiters.add(fn);
+      return () => this.cancelWaiters.delete(fn);
     },
     broadcast(event) {
       const payload = `data: ${JSON.stringify(event)}\n\n`;
@@ -87,6 +119,8 @@ function createJob(jobId) {
         meta: this.meta,
         error: this.error,
         hasOutput: Boolean(this.outputPath),
+        cancelled: this.cancelled,
+        cancellable: !['done', 'error', 'cancelled'].includes(this.status) && !this.cancelled,
       };
     },
   };
@@ -132,11 +166,17 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
           // run; without passing it through, the Summary sheet claimed
           // "scraped engines" even on a healthy Serper key.
           searchProvider: job.meta.searchProvider,
+          // A cancelled run still gets a report; the sheet says so rather
+          // than passing partial results off as a complete list.
+          cancelled: job.cancelled,
+          companiesProcessed: job.progress.completed,
         });
         job.outputPath = `/api/download/${jobId}`;
         job.outputFile = outPath;
-        job.status = 'done';
-        job.log('DONE - report ready for download');
+        job.status = job.cancelled ? 'cancelled' : 'done';
+        job.log(job.cancelled
+          ? `CANCELLED - partial report ready (${rows.length} row(s) from ${job.progress.completed} company/companies)`
+          : 'DONE - report ready for download');
       } catch (err) {
         console.error(err);
         job.status = 'error';
@@ -177,6 +217,19 @@ app.get('/api/serper-check', (req, res) => {
   res.json({ ...serperStatus(), ok: null, skipped: true, message: 'Use POST /api/search-check to test the selected provider' });
 });
 
+app.post('/api/cancel/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  const cancelled = job.cancel();
+  res.json({
+    ok: cancelled,
+    status: job.status,
+    message: cancelled
+      ? 'Stopping after the company currently being researched'
+      : `Job already ${job.status}`,
+  });
+});
+
 app.get('/api/status/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
@@ -199,7 +252,7 @@ app.get('/api/events/:jobId', (req, res) => {
   res.write(`data: ${JSON.stringify({ type: 'logs', lines: job.logs })}\n\n`);
   res.write(`data: ${JSON.stringify({ type: 'rows', rows: job.rows })}\n\n`);
   res.write(`data: ${JSON.stringify({ type: 'state', state: job.snapshot() })}\n\n`);
-  if (job.status === 'done' || job.status === 'error') return res.end();
+  if (['done', 'error', 'cancelled'].includes(job.status)) return res.end();
   job.listeners.add(res);
   req.on('close', () => job.listeners.delete(res));
 });

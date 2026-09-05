@@ -87,6 +87,13 @@
         <span id="currentCompanyName"></span>
       </div>
 
+      <button type="button" id="cancelBtn" class="btn btn-danger hidden">
+        Cancel Processing
+      </button>
+      <p id="cancelHint" class="hint hidden">
+        Stops after the company being researched right now. Rows already found are kept and still exported.
+      </p>
+
       <div class="stats-row">
         <div class="stat">
           <span class="stat-value" id="statCompanies">0</span>
@@ -111,6 +118,7 @@
       <div id="doneBanner" class="banner banner-success hidden">
         Processing complete! Your Excel report is ready.
       </div>
+      <div id="cancelBanner" class="banner banner-warn hidden"></div>
       <div id="errorBanner" class="banner banner-error hidden"></div>
 
       <div class="table-wrap">

@@ -174,6 +174,14 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
     { metric: 'LLM Layer', value: meta.llmEnabled ? 'Enabled' : 'Heuristic mode (no API key)' },
     { metric: 'Search Provider', value: meta.searchProvider || 'scraped engines' },
   ]);
+  // A cancelled run produces a real report of partial results; say so, so the
+  // missing companies read as "stopped early", not "nothing found".
+  if (meta.cancelled) {
+    sumWs.addRow({
+      metric: 'Run Status',
+      value: `Cancelled by user after ${meta.companiesProcessed ?? totalCompanies} of ${meta.totalCompanies ?? totalCompanies} companies`,
+    }).font = { bold: true };
+  }
 
   // Where the NULLs actually come from — the whole point of keeping status.
   const byStatus = new Map();

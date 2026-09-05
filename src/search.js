@@ -124,7 +124,7 @@ function queryConstraints(query) {
  * This is what keeps a degraded engine's cached entity page from being
  * mistaken for real results.
  */
-function isRelevant(result, { site, phrases, tokens }, { trusted = false } = {}) {
+function isRelevant(result, { site, phrases, tokens }, { trusted = false, minTokenCoverage = 0 } = {}) {
   const url = String(result.url || '').toLowerCase();
   const hay = `${url} ${String(result.title || '')} ${String(result.snippet || '')}`.toLowerCase();
   const tight = hay.replace(/[^a-z0-9]/g, '');
@@ -142,7 +142,8 @@ function isRelevant(result, { site, phrases, tokens }, { trusted = false } = {})
   }
 
   if (!phrases.length && tokens.length) {
-    if (!tokens.some((t) => hay.includes(t) || tight.includes(t))) return false;
+    const hits = tokens.filter((t) => hay.includes(t) || tight.includes(t)).length;
+    if (!hits || hits / tokens.length < minTokenCoverage) return false;
   }
   return true;
 }
@@ -222,8 +223,22 @@ function toResults(raw) {
     const url = normalizeUrl(href);
     if (!url) continue;
     const key = url.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.set(key, { url: key, title: cleanTitle(title), snippet: cleanTitle(snippet || '') });
+    const result = { url: key, title: cleanTitle(title), snippet: cleanTitle(snippet || '') };
+    const previous = seen.get(key);
+    // Different engines can put the employer in either the title or snippet.
+    // Keep the fuller title and all distinct excerpts for this same URL.
+    if (previous) {
+      const titleWords = (title) => title.trim().split(/\s+/).filter(Boolean).length;
+      if (titleWords(previous.title) > titleWords(result.title) ||
+          (titleWords(previous.title) === titleWords(result.title) && previous.title.length >= result.title.length)) {
+        result.title = previous.title;
+      }
+      if (!result.snippet || previous.snippet.includes(result.snippet)) result.snippet = previous.snippet;
+      else if (previous.snippet && !result.snippet.includes(previous.snippet)) {
+        result.snippet = `${previous.snippet} ${result.snippet}`;
+      }
+    }
+    seen.set(key, result);
   }
   return [...seen.values()];
 }
@@ -338,7 +353,7 @@ async function verifySerperKey() {
 }
 
 /** Query the configured SearXNG instance's JSON API. */
-async function runSearxng(query, { engines = '' } = {}) {
+async function runSearxng(query, { engines = '', log = null } = {}) {
   const url = new URL(currentSearchConfig().searxngUrl);
   url.searchParams.set('q', query);
   url.searchParams.set('format', 'json');
@@ -363,14 +378,23 @@ async function runSearxng(query, { engines = '' } = {}) {
       throw new Error('SearXNG did not return JSON. Enable json in search.formats in settings.yml');
     }
     if (!data || !Array.isArray(data.results)) throw new Error('Invalid SearXNG response: missing results array');
-    if (!data.results.length && data.unresponsive_engines?.length) {
-      const reasons = data.unresponsive_engines.map((entry) =>
+    const constraints = queryConstraints(query);
+    const results = toResults(data.results.filter((r) => {
+      if (!r || typeof r.url !== 'string') return false;
+      const sources = Array.isArray(r.engines) ? r.engines : [r.engine];
+      if (!sources.length || !sources.every((engine) => /^bing(?:\b|_)/i.test(engine || ''))) return true;
+      // Bing sometimes returns a cached page about just the first word,
+      // e.g. "Blue" instead of "Blue Tokai". These are not useful hits.
+      const [result] = toResults([{ href: r.url, title: r.title, snippet: r.content }]);
+      return result && isRelevant(result, constraints, { minTokenCoverage: 0.6 });
+    }).map((r) => ({ href: r.url, title: r.title || '', snippet: r.content || '' })));
+    if (data.unresponsive_engines?.length) {
+      const details = data.unresponsive_engines.map((entry) =>
         Array.isArray(entry) ? entry.slice(0, 2).join(': ') : String(entry)).join('; ');
-      throw new Error(`SearXNG returned no results because upstream engines are unavailable (${reasons}); retry later`);
+      if (log) log(`      [searxng] unavailable engines: ${details}`);
+      if (!results.length) throw new Error(`SearXNG returned no results because upstream engines are unavailable (${details}); retry later`);
     }
-    return toResults(data.results.filter((r) => r && typeof r.url === 'string').map((r) => ({
-      href: r.url, title: r.title || '', snippet: r.content || '',
-    })));
+    return results;
   } catch (err) {
     if (err.name === 'AbortError') throw new Error('SearXNG timed out after 20 seconds');
     if (err.message === 'fetch failed') throw new Error('Cannot reach SearXNG. Check the instance URL and that it is running');
@@ -383,7 +407,8 @@ async function runSearxng(query, { engines = '' } = {}) {
 async function verifySearchProvider() {
   if (currentSearchConfig().provider === 'serper') return verifySerperKey();
   try {
-    await runSearxng('linkedin');
+    const results = await runSearxng('linkedin');
+    if (!results.length) throw new Error('SearXNG returned no search results for the connection check; check that its search engines are working');
     return { configured: true, ok: true };
   } catch (err) {
     return { configured: true, ok: false, error: err.message };
@@ -510,27 +535,31 @@ async function runEngine(engine, encodedQuery) {
 // Each engine round-trip costs seconds; identical queries recur constantly.
 const queryCache = new Map();
 const QUERY_CACHE_MAX = 500;
+const QUERY_CACHE_TTL_MS = 10 * 60 * 1000;
 
 async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } = {}) {
   const config = currentSearchConfig();
   const cacheKey = JSON.stringify([config.provider, config.provider === 'searxng' ? config.searxngUrl : '',
     config.provider === 'searxng' ? searxngEngines : '', query.toLowerCase().trim()]);
-  if (queryCache.has(cacheKey)) {
+  if (queryCache.get(cacheKey)?.expiresAt > Date.now()) {
     const { results, source } = queryCache.get(cacheKey);
     noteSearchProvider(source);
     if (log) log(`      [cache: ${source}] ${results.length} result(s)`);
     return results.slice(0, limit);
   }
+  queryCache.delete(cacheKey);
 
   const encoded = encodeURIComponent(query);
   const constraints = queryConstraints(query);
   let lastRelevant = [];
 
   const remember = (results, source = config.provider) => {
+    // Empty or filtered-out results must be retried after engines recover.
+    if (!results.length) return [];
     if (queryCache.size >= QUERY_CACHE_MAX) {
       queryCache.delete(queryCache.keys().next().value);
     }
-    queryCache.set(cacheKey, { results, source });
+    queryCache.set(cacheKey, { results, source, expiresAt: Date.now() + QUERY_CACHE_TTL_MS });
     return results.slice(0, limit);
   };
 
@@ -540,7 +569,7 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
     const source = searxngEngines ? `searxng/${searxngEngines}` : 'searxng';
     try {
       if (log && searxngEngines) log(`      [${source}] searching: ${query}`);
-      const results = await runSearxng(query, { engines: searxngEngines });
+      const results = await runSearxng(query, { engines: searxngEngines, log });
       const relevant = results.filter((r) => isRelevant(r, constraints, { trusted: true }));
       if (log) log(`      [${source}] ${results.length} raw / ${relevant.length} relevant`);
       noteSearchProvider(source);
@@ -549,8 +578,8 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
       if (searxngEngines) {
         if (log) log(`      [${source}] failed: ${err.message}`);
         // Explicit Google-through-SearXNG lookups stay on that provider.
-        // Report provider failures instead of treating a CAPTCHA as no match.
-        throw err;
+        // Leave failures uncached so a later query can retry.
+        return [];
       }
       if (log) log(`      [searxng] failed: ${err.message}; trying scraped engines`);
     }

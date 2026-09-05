@@ -194,7 +194,7 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
     log,
     accept: (r) =>
       isPersonalProfileUrl(r.url) &&
-      validateLinkedInCandidate(r.url, r.title, personName, companyName) >= MATCH_THRESHOLD,
+      validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) >= MATCH_THRESHOLD,
     minAccepted: 1,
   });
 
@@ -206,7 +206,7 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
   }
 
   const scored = profiles
-    .map((r) => ({ ...r, score: validateLinkedInCandidate(r.url, r.title, personName, companyName) }))
+    .map((r) => ({ ...r, score: validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) }))
     .sort((a, b) => b.score - a.score);
 
   const best = scored[0];
@@ -223,7 +223,7 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
     // overrule the surname rule. Without this a non-person that slipped
     // through ("AIG Hospitals") was handed someone else's profile.
     const chosen = profiles.find((p) => p.url === llmPick) || { url: llmPick, title: '' };
-    const sanity = validateLinkedInCandidate(chosen.url, chosen.title, personName, companyName);
+    const sanity = validateLinkedInCandidate(chosen.url, chosen.title, personName, companyName, chosen.snippet);
     if (sanity > 0) {
       log(`    LLM picked: ${llmPick}`);
       return llmPick;

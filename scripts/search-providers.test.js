@@ -114,7 +114,7 @@ test('Google-through-SearXNG failure cannot switch to Serper or direct scrapers'
     return new Response('', { status: 503 });
   });
   await withSearchConfig(sx, async () => {
-    await assert.rejects(searchWeb('Google provider failure test', { searxngEngines: 'google' }), /SearXNG HTTP 503/);
+    assert.deepEqual(await searchWeb('Google provider failure test', { searxngEngines: 'google' }), []);
   });
   assert.deepEqual(origins, ['http://localhost:8080']);
 });
@@ -126,8 +126,9 @@ test('connection check reports access, rate limit, invalid JSON and upstream fai
     [() => new Response('Unavailable', { status: 503 }), /HTTP 503/],
     [() => new Response('<html>challenge</html>'), /did not return JSON/],
     [() => json({}), /missing results array/],
+    [() => json({ results: [] }), /no search results for the connection check/],
     [() => json({ results: [], unresponsive_engines: [['google', 'timeout']] }), /upstream engines/],
-    [() => json({ results: [], unresponsive_engines: [['google', 'Suspended: CAPTCHA']] }), /google: Suspended: CAPTCHA/],
+    [() => json({ results: [], unresponsive_engines: [['google', 'CAPTCHA']] }), /google: CAPTCHA/],
     [() => { throw new TypeError('fetch failed'); }, /Cannot reach/],
   ];
   let respond;
@@ -179,7 +180,7 @@ test('agent checks selected SearXNG provider, records it, and fails early for se
   let failed = false;
   t.mock.method(globalThis, 'fetch', async (input) => {
     assert.equal(new URL(input).hostname, 'localhost');
-    return failed ? new Response('', { status: 403 }) : json({ results: [] });
+    return failed ? new Response('', { status: 403 }) : json({ results: [{ url: 'https://www.linkedin.com/', title: 'LinkedIn' }] });
   });
   const meta = {};
   const job = { log() {}, setMeta(value) { Object.assign(meta, value); } };

@@ -34,7 +34,7 @@ test('settings, connection checks and upload routes respect the selected provide
     assert.equal(url.origin, 'http://127.0.0.1:8080', 'unexpected external or paid search request');
     assert.equal(url.pathname, '/search');
     searchCalls++;
-    return new Response(JSON.stringify({ results: [] }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ results: [{ url: 'https://www.linkedin.com/', title: 'LinkedIn' }] }), { headers: { 'Content-Type': 'application/json' } });
   });
 
   const settings = await (await fetch(`${origin}/api/search-config`)).json();

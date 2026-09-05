@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test scripts/search-providers.test.js scripts/search-routes.test.js scripts/zauba-linkedin.test.js scripts/zauba-directors.test.js scripts/agent-completion.test.js scripts/agent-registry-fallback.test.js && node scripts/test-agent-flow.js && node scripts/test-rules.js",
+    "test": "node --test scripts/search-providers.test.js scripts/search-recovery.test.js scripts/search-routes.test.js scripts/zauba-linkedin.test.js scripts/zauba-directors.test.js scripts/zauba-snippets.test.js scripts/null-matching.test.js scripts/agent-completion.test.js scripts/agent-registry-fallback.test.js scripts/agent-cancel.test.js scripts/cancel-job.test.js && node scripts/test-agent-flow.js && node scripts/test-rules.js",
     "test:ui": "node scripts/test-search-ui.js && node --test scripts/zauba-section-ui.test.js",
     "install-browser": "npx playwright install chromium"
   },

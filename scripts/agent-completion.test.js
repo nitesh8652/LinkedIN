@@ -41,7 +41,7 @@ test('ZaubaCorp fallback resolves LinkedIn with SearXNG, completes every company
     origins.push(url.origin);
     const q = url.searchParams.get('q') || '';
     const brand = q.includes('alphabrand') ? 'Alphabrand' : 'Betabrand';
-    const results = q.includes('"Rajesh Sharma"') ? [{
+    const results = q === 'linkedin' ? [{ url: 'https://www.linkedin.com/', title: 'LinkedIn' }] : q.includes('"Rajesh Sharma"') ? [{
       url: `https://in.linkedin.com/in/rs-${brand.toLowerCase()}`,
       title: 'Rajesh Sharma - Director | LinkedIn', content: `Experience: ${brand} Foods.`,
     }] : [];

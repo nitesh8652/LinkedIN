@@ -29,20 +29,26 @@ SEARXNG_URL=http://localhost:8080
 
 Both the base instance URL and its `/search` URL are accepted, including deployments under a path prefix. An unavailable SearXNG instance stops a job at its initial connection check with a setup error. Later search failures use the existing scraped engines and are logged, without switching to Serper.
 
+The connection check requires actual search results; an empty JSON response is not treated as a working engine. Upstream CAPTCHA and timeout messages appear in the log. Empty searches are retried on later runs, and successful cached results expire after ten minutes.
+
 The legacy `GET /api/serper-check` endpoint only reports configuration; it no longer makes a paid request. Use the **Test connection** button (`POST /api/search-check`) to test the selected provider explicitly.
 
-ZaubaCorp is searched immediately if the official website is missing. If website research finds directors but leaves any LinkedIn URLs missing, the agent also searches ZaubaCorp once for that company. Existing matches are preserved, and matching registry names enrich the same rows without duplicates. If all website directors already have LinkedIn URLs, the registry lookup is skipped.
+When ZaubaCorp is used, a matching SearXNG result opens the company page at `#director-information` (the **Directors** section). The agent expands collapsed director panels, waits for rows to load, and extracts all current directors from that section. Past appointments and unrelated tables are excluded. Older layouts are used only when the section is absent.
 
-A matching ZaubaCorp result opens the company page at `#director-information` (the **Directors** section). The agent expands collapsed director panels, waits for rows to load, and extracts all current directors from that section. Past appointments and unrelated tables are excluded. Older layouts are used only when the section is absent.
+If the company page cannot be loaded or has no Directors section, the agent can recover explicitly named directors from indexed ZaubaCorp company summaries and current director associations. These rows are marked **ZaubaCorp (search result)** and link to the indexed source. A present empty Directors section is never replaced with indexed names.
 
-Each registry name is searched together with the company, starting with a plain query such as `Plasmagen Biosciences Arnav Jain`. In SearXNG mode, these profile lookups explicitly select its Google engine, then use LinkedIn-specific query variants if necessary. The Google engine must be enabled on the instance. These lookups never switch to Serper or direct scrapers if Google is unavailable. Upstream errors such as `google: Suspended: CAPTCHA` are shown in the job log.
+The results retain DIN/DPIN numbers and appointment dates, and the ZaubaCorp source link opens the Directors section. These details and the source URL are included in the Excel report. LinkedIn lookups try both registry names and names without middle names; a URL is returned only when the result supports both the person's identity and company, including company information in the snippet. Unverified URLs are shown as `NULL`.
 
-The results retain DIN/DPIN numbers and appointment dates, and the ZaubaCorp source link opens the Directors section. These details and the source URL are included in the Excel report. LinkedIn lookups try both registry names and names without middle names; a URL is returned from the search results only when the result supports both the person's identity and company, including company information in the snippet. Unverified URLs are shown as `NULL`.
+Progress counts completed companies and reaches 100% when the Excel report is ready. Event streaming and fallback polling stop on completion, cancellation, or failure; polling snapshots replace previous rows and logs without duplicating them.
 
-Progress counts completed companies and reaches 100% when the Excel report is ready. Event streaming and fallback polling stop on completion or failure; polling snapshots replace previous rows and logs without duplicating them.
+## Cancelling a run
+
+**Cancel Processing** in the *Processing Status* card stops a job in progress (`POST /api/cancel/:jobId`). Cancellation is cooperative: the agent stops at its next clean boundary - after the company it is currently researching, or between LinkedIn lookups within it - so nothing is lost mid-write. The remaining companies are skipped and the wait between companies is cut short.
+
+Rows already collected are kept and still written to Excel: the job ends as `cancelled` with a downloadable partial report whose Summary sheet records `Cancelled by user after N of M companies`. A job that already finished or failed cannot be cancelled, and the button disappears once a job reaches a terminal state.
 
 ## Checks
 
-`npm test` runs offline search-provider, ZaubaCorp LinkedIn matching, job completion, route, and matching-rule regression checks without spending API credits.
+`npm test` runs offline search-provider, ZaubaCorp LinkedIn matching, job completion, cancellation, route, and matching-rule regression checks without spending API credits.
 
-`npm run test:ui` checks provider controls, upload flow, progress, stream replay, polling retries, and completion in headless Chromium with mocked search responses.
+`npm run test:ui` checks provider controls, upload flow, progress, stream replay, polling retries, cancellation with a partial report, and completion in headless Chromium with mocked search responses.

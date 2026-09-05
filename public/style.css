@@ -147,6 +147,12 @@ header p { color: var(--muted); font-size: 14px; }
   background: #b6c5e3; cursor: not-allowed; box-shadow: none;
 }
 .btn-download { width: auto; padding: 14px 34px; }
+.btn-danger {
+  background: #fff; color: var(--danger);
+  border: 1px solid #fecaca;
+}
+.btn-danger:hover:not(:disabled) { background: #fee2e2; }
+.btn-danger:disabled { color: var(--muted); border-color: var(--border); cursor: not-allowed; }
 
 /* ---------- Progress ---------- */
 .progress-track {
@@ -226,6 +232,7 @@ header p { color: var(--muted); font-size: 14px; }
 }
 .banner-success { background: #dcfce7; color: var(--success); }
 .banner-error { background: #fee2e2; color: var(--danger); }
+.banner-warn { background: #fef3c7; color: #b45309; }
 
 .table-wrap {
   max-height: 380px;

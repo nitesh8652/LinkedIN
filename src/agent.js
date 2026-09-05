@@ -186,9 +186,9 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
       linkedinUrl: verdict.url,
       din: person.din || null,
       appointmentDate: person.appointmentDate || null,
-      sourceUrl: zauba.pageUrl || null,
+      sourceUrl: person.sourceUrl || zauba.pageUrl || null,
       status,
-      source: ZAUBA_SOURCE,
+      source: person.source || ZAUBA_SOURCE,
     });
   }
   return rows;
@@ -216,6 +216,35 @@ function mergeDirectorRows(rows, registryRows) {
     };
   }
   return merged;
+}
+
+/**
+ * Cooperative cancellation. The job object owns the flag; the agent only ever
+ * reads it, so a cancelled run stops at a clean boundary (between companies,
+ * or between the per-person LinkedIn lookups) instead of being killed
+ * mid-write and losing the rows already collected.
+ */
+function isCancelled(job) {
+  return Boolean(job.cancelled);
+}
+
+/**
+ * Human-like pacing between companies, cut short by a cancel: waiting out a
+ * three-second sleep after the user asked to stop just looks broken.
+ */
+function pauseBetweenCompanies(job) {
+  return new Promise((resolve) => {
+    let unregister = null;
+    const timer = setTimeout(finish, 1500 + Math.random() * 2000);
+    function finish() {
+      clearTimeout(timer);
+      // Drop the waiter on the normal path too, so a long company list does
+      // not leave one dead callback per company on the job.
+      if (unregister) unregister();
+      resolve();
+    }
+    unregister = job.onCancel?.(finish) ?? null;
+  });
 }
 
 async function processCompany(companyName, job) {
@@ -332,6 +361,10 @@ async function processCompany(companyName, job) {
     // Step 3: LinkedIn lookup per person
     const rows = [];
     for (const person of leaders.slice(0, MAX_PEOPLE_PER_COMPANY)) {
+      if (isCancelled(job)) {
+        log('cancelled - keeping the rows found so far');
+        break;
+      }
       const designation = person.designation || 'Director';
       let url = person.linkedinUrl || null;
 
@@ -398,6 +431,10 @@ async function runAgentWithProvider(companies, job) {
   const allRows = [];
   try {
     for (let i = 0; i < companies.length; i++) {
+      if (isCancelled(job)) {
+        job.log(`Cancelled - stopped after ${i} of ${companies.length} companies`);
+        break;
+      }
       const company = companies[i];
       job.setProgress({ current: i + 1, completed: i, company });
       const rows = await processCompany(company, job);
@@ -407,8 +444,8 @@ async function runAgentWithProvider(companies, job) {
       }
       job.setProgress({ current: i + 1, completed: i + 1, company: null });
       // Pace only between companies; the final result can finish immediately.
-      if (i < companies.length - 1) {
-        await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+      if (i < companies.length - 1 && !isCancelled(job)) {
+        await pauseBetweenCompanies(job);
       }
     }
   } finally {

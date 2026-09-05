@@ -15,6 +15,7 @@ const app = require('../server');
     let uploads = 0;
     let polls = 0;
     let pollStreams = 0;
+    let cancelPosts = 0;
     const row = { companyName: 'Acme', personName: 'Asha Rao', designation: 'Director', linkedinUrl: 'https://linkedin.com/in/asha-rao', source: 'ZaubaCorp', status: 'ok', din: '00001234', appointmentDate: '20/09/2006', sourceUrl: 'https://www.zaubacorp.com/company#director-information' };
     const event = (type, data) => `data: ${JSON.stringify({ type, ...data })}\n\n`;
     page.on('pageerror', (error) => errors.push(error.message));
@@ -33,7 +34,7 @@ const app = require('../server');
       if (url.pathname === '/api/upload') {
         assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nsearxng/);
         assert.match(request.postDataBuffer().toString(), /http:\/\/localhost:9999/);
-        const jobId = ['ui-test', 'ui-poll', 'ui-error'][uploads++];
+        const jobId = ['ui-test', 'ui-poll', 'ui-error', 'ui-cancel'][uploads++];
         return route.fulfill({ json: { jobId, companiesFound: 2, companies: ['Acme', 'Fable'] } });
       }
       if (url.pathname === '/api/events/ui-test') return route.fulfill({
@@ -63,6 +64,22 @@ const app = require('../server');
         event('logs', { lines: ['FATAL: test failure'] }) + event('rows', { rows: [row] }) +
         event('state', { state: { status: 'error', error: 'test failure', progress: { current: 2, total: 2, completed: 1, company: null } } }),
       });
+      if (url.pathname === '/api/events/ui-cancel') return route.fulfill({
+        contentType: 'text/event-stream',
+        body: event('logs', { lines: ['First company fetched'] }) + event('rows', { rows: [row] }) +
+          event('state', { state: { status: 'running', rowsCount: 1, cancellable: true, progress: { current: 2, total: 2, completed: 1, company: 'Fable' } } }),
+      });
+      if (url.pathname === '/api/cancel/ui-cancel') {
+        assert.equal(request.method(), 'POST');
+        cancelPosts++;
+        return route.fulfill({ json: { ok: true, status: 'cancelling', message: 'Stopping after the company currently being researched' } });
+      }
+      if (url.pathname === '/api/status/ui-cancel') return route.fulfill({ json: {
+        status: cancelPosts ? 'cancelled' : 'running', cancelled: Boolean(cancelPosts), cancellable: !cancelPosts,
+        rowsCount: 1, rows: [row], logs: ['First company fetched'],
+        progress: { current: 2, total: 2, completed: 1, company: cancelPosts ? null : 'Fable' },
+        meta: { searchProvider: 'SearXNG' }, hasOutput: Boolean(cancelPosts),
+      } });
       if (url.pathname.startsWith('/api/status/')) throw new Error('Unexpected polling after terminal state');
       return route.continue();
     });
@@ -111,13 +128,33 @@ const app = require('../server');
     assert.equal(await page.locator('#resultsTable tbody tr').count(), 1);
     assert.equal(await page.locator('#statLinkedin').textContent(), '1', 'new uploads must reset counters');
     assert.match(await page.locator('#logBox').textContent(), /FATAL: test failure/);
+    // Cancel a running job: the button only exists while a job can be stopped,
+    // and the partial results stay downloadable.
+    await page.getByRole('button', { name: 'Upload & Start Processing' }).click();
+    await page.waitForFunction(() => !document.getElementById('cancelBtn').classList.contains('hidden'));
+    assert.equal(await page.locator('#cancelBtn').isVisible(), true);
+    await page.getByRole('button', { name: 'Cancel Processing' }).click();
+    await page.waitForFunction(() => document.getElementById('cancelBtn').textContent.trim() === 'Cancelling...');
+    assert.equal(await page.locator('#cancelBtn').isDisabled(), true, 'a second click must not send a second cancel');
+    await page.waitForFunction(() => document.getElementById('progressText').textContent === 'Cancelled.');
+    assert.equal(cancelPosts, 1);
+    assert.equal(await page.locator('#cancelBtn').isVisible(), false, 'a stopped job has nothing left to cancel');
+    assert.equal(await page.locator('#doneBanner').isVisible(), false, 'a cancelled run must not claim completion');
+    assert.match(await page.locator('#cancelBanner').textContent(), /Processing cancelled\. 1 result row\(s\)/);
+    assert.equal(await page.locator('#percentText').textContent(), '50%', 'cancelled jobs must not show 100%');
+    assert.equal(await page.locator('#downloadBtn').getAttribute('href'), '/api/download/ui-cancel');
+    assert.match(await page.locator('#downloadBtn').textContent(), /Download Partial Report/);
+    const cancelPolls = polls;
+    await page.waitForTimeout(2500);
+    assert.equal(polls, cancelPolls, 'polling must stop once the job is cancelled');
+
     await page.getByRole('button', { name: 'Serper Uses API credits' }).click();
     assert.equal(await page.locator('#searxngSettings').isVisible(), false);
     assert.equal(await page.locator('#jobSearchProvider').textContent(), 'Search: SearXNG');
     await page.setViewportSize({ width: 375, height: 812 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.deepEqual(errors, []);
-    console.log('PASS: provider controls, completed replay, accurate progress, polling retries without duplicates, terminal shutdown, counter resets, and mobile layout');
+    console.log('PASS: provider controls, completed replay, accurate progress, polling retries without duplicates, cancellation with a partial report, terminal shutdown, counter resets, and mobile layout');
   } finally {
     if (browser) await browser.close();
     await new Promise((resolve) => server.close(resolve));

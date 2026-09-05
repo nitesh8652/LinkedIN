@@ -39,6 +39,7 @@ const {
 
 /** Values written into the report's Source column. */
 const ZAUBA_SOURCE = 'ZaubaCorp';
+const ZAUBA_SEARCH_SOURCE = 'ZaubaCorp (search result)';
 const WEBSITE_SOURCE = 'Official Website';
 
 const ZAUBA_HOST = 'www.zaubacorp.com';
@@ -202,6 +203,8 @@ function matchCompanyName(inputName, candidateName) {
 
 // /COMPANY-NAME-<CIN>, e.g. /TIMES-COMTRADE-PRIVATE-LIMITED-U34100GJ2006PTC049120
 const COMPANY_PATH_RE = /^\/([A-Za-z0-9&'.\-%]+)-([A-Za-z][A-Za-z0-9-]{7,30})\/?$/;
+// Search indexes still return the older /company/COMPANY-NAME/CIN layout.
+const LEGACY_COMPANY_PATH_RE = /^\/company\/([A-Za-z0-9&'.\-%]+)\/([A-Za-z][A-Za-z0-9-]{7,30})\/?$/i;
 
 /** A ZaubaCorp *company* page (not a director page, not a listing page). */
 function parseCompanyUrl(rawUrl) {
@@ -213,10 +216,11 @@ function parseCompanyUrl(rawUrl) {
   }
   if (u.hostname.replace(/^www\./i, '').toLowerCase() !== 'zaubacorp.com') return null;
 
-  const m = u.pathname.match(COMPANY_PATH_RE);
+  const m = u.pathname.match(COMPANY_PATH_RE) || u.pathname.match(LEGACY_COMPANY_PATH_RE);
   if (!m) return null;
 
-  const slug = decodeURIComponent(m[1]);
+  let slug;
+  try { slug = decodeURIComponent(m[1]); } catch { return null; }
   const id = m[2];
   // A CIN is a letter followed by digits and letters (U34100GJ2006PTC049120);
   // an LLPIN looks like AAK-7453. Director pages end in a bare 8-digit DIN,
@@ -428,7 +432,7 @@ async function searchZaubaCandidates(companyName, log) {
       altName: parsed.nameFromSlug,
     });
   }
-  return out;
+  return { candidates: out, results };
 }
 
 /**
@@ -631,6 +635,75 @@ function parseDirectorsFromHtml(html, companyName = '') {
   return [...found.values()];
 }
 
+/**
+ * Recover explicitly named registry directors from indexed search evidence.
+ * Company summaries take priority; director pages need a current association
+ * row naming this company and the person's role. A name or company mention
+ * alone is not enough, and past association sections are never accepted.
+ */
+function parseDirectorsFromSearchResults(results, companyName) {
+  const companyTokens = companyTokensOf(companyName);
+  const found = new Map();
+  const plain = (text) => cheerio.load(String(text || '')).text().replace(/\s+/g, ' ').trim();
+  const push = (rawName, designation, din, appointmentDate, sourceUrl) => {
+    const name = cleanName(rawName);
+    if (!isValidPersonName(name, { companyTokens })) return;
+    const key = nameKey(name);
+    if (!key || found.has(key)) return;
+    found.set(key, {
+      name, designation, din: din || null, appointmentDate: appointmentDate || null,
+      source: ZAUBA_SEARCH_SOURCE, sourceUrl,
+    });
+  };
+
+  for (const result of results) {
+    const company = parseCompanyUrl(result.url);
+    if (!company || !matchCompanyName(companyName, company.nameFromSlug).accepted) continue;
+    // Removing dots from initials keeps "K. Krithivasan" inside the sentence.
+    const text = plain(result.snippet).replace(/\b([A-Z])\./g, '$1');
+    const statements = [...text.matchAll(/\bDirectors?\s+of\s+(.{2,150}?)\s+(?:are|is)\s+([^.;]{4,400})[.;]/gi)];
+    for (const match of statements) {
+      const prefix = text.slice(Math.max(0, match.index - 30), match.index);
+      if (/\b(?:past|former|previous|resigned)\s*$/i.test(prefix)) continue;
+      if (!matchCompanyName(companyName, match[1]).accepted) continue;
+      for (const name of match[2].split(/,|\band\b|&/i)) {
+        push(name, 'Director', '', '', result.url);
+      }
+    }
+  }
+
+  for (const result of results) {
+    let url;
+    try { url = new URL(result.url); } catch { continue; }
+    if (url.hostname.replace(/^www\./i, '').toLowerCase() !== 'zaubacorp.com') continue;
+    const path = url.pathname.match(/^\/([A-Za-z0-9'.%\-]+)-(\d{8})\/?$/) ||
+      url.pathname.match(/^\/director\/([A-Za-z0-9'.%\-]+)\/(\d{8})\/?$/i);
+    if (!path) continue;
+    let slugName;
+    try { slugName = decodeURIComponent(path[1]).replace(/-+/g, ' ').toUpperCase(); } catch { continue; }
+    const name = cleanName(plain(result.title).replace(/\s*[|–—]\s*ZaubaCorp.*$/i, '').trim());
+    // Both the page title and its DIN URL must identify the same person.
+    if (!name || nameKey(name) !== nameKey(slugName)) continue;
+
+    const text = plain(result.snippet);
+    const active = text.split(/\b(?:past|former|previous)\s+(?:companies|directorships|appointments)\b/i)[0];
+    const heading = /\b(?:current\s+)?companies\s+associated\s+with\b/i.exec(active);
+    if (!heading) continue;
+    const associations = active.slice(heading.index + heading[0].length).replace(/^[\s:;,]+/, '');
+    for (const row of associations.split(/\s*[;|]\s*/)) {
+      if (/\b(?:past|former|resigned|ceased|cessation)\b/i.test(row)) continue;
+      const cells = row.split(/\s*,\s*/);
+      if (cells.length < 2 || !matchCompanyName(companyName, cells[0]).accepted) continue;
+      const designation = cells[1].trim();
+      if (designation.length > 60 || !/\b(?:director|designated partner)\b/i.test(designation)) continue;
+      const date = (cells[2] || '').trim();
+      const appointmentDate = /^\d{1,2}[-/](?:\d{1,2}|[A-Za-z]{3,9})[-/]\d{4}$/.test(date) ? date : '';
+      push(name, tidyZaubaDesignation(designation), path[2], appointmentDate, result.url);
+    }
+  }
+  return [...found.values()];
+}
+
 /* ------------------------------------------------------------------ *
  * Public entry point: directors from ZaubaCorp
  * ------------------------------------------------------------------ */
@@ -658,7 +731,7 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
   try {
     log('ZaubaCorp fallback: searching company registry...');
 
-    const candidates = await searchZaubaCandidates(companyName, log);
+    const { candidates, results: searchResults } = await searchZaubaCandidates(companyName, log);
     log(`  ${candidates.length} ZaubaCorp page candidate(s) from web search`);
 
     let best = pickBestCandidate(companyName, candidates, log);
@@ -683,25 +756,38 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
     );
 
     const pageUrl = `${best.url}${DIRECTOR_SECTION}`;
-    const html = await loadZaubaHtml(pageUrl, log, { directors: true });
-    if (!html) {
-      return fail('ZaubaCorp page could not be loaded', {
-        pageUrl,
-        matchedName: best.candidateName,
-        confidence: best.match.confidence,
-      });
+    let html = null;
+    try { html = await loadZaubaHtml(pageUrl, log, { directors: true }); } catch (err) {
+      log(`    ZaubaCorp page could not be loaded: ${err.message}`);
     }
 
-    const directors = parseDirectorsFromHtml(html, companyName);
+    let directors = html ? parseDirectorsFromHtml(html, companyName) : [];
+    const hasDirectorSection = Boolean(html && cheerio.load(html)(DIRECTOR_SECTION).length);
+    // An explicitly present empty Directors section remains authoritative.
+    // Indexed snippets are a recovery path only when the page/section is absent.
+    if (!directors.length && !hasDirectorSection) {
+      log('    checking indexed ZaubaCorp results for explicit director names');
+      directors = parseDirectorsFromSearchResults(searchResults, companyName);
+      if (!directors.length) {
+        const extraResults = await searchWithFallbackQueries(
+          () => [`site:zaubacorp.com "${best.altName || companyName}" "Director"`],
+          { log, accept: (r) => parseDirectorsFromSearchResults([r], companyName).length > 0, minAccepted: 1 }
+        );
+        directors = parseDirectorsFromSearchResults(extraResults, companyName);
+      }
+    }
     if (!directors.length) {
-      return fail('Directors unavailable', {
+      return fail(html ? 'Directors unavailable' : 'ZaubaCorp page could not be loaded; indexed results did not identify directors', {
         pageUrl,
         matchedName: best.candidateName,
         confidence: best.match.confidence,
       });
     }
 
-    log(`  ZaubaCorp listed ${directors.length} current director(s)`);
+    const fromSearch = directors.some((director) => director.source === ZAUBA_SEARCH_SOURCE);
+    log(fromSearch
+      ? `  ZaubaCorp search results identified ${directors.length} director(s); source links retained`
+      : `  ZaubaCorp listed ${directors.length} current director(s)`);
     return {
       ok: true,
       directors: directors.map((d) => ({ ...d, companyName })),
@@ -859,6 +945,7 @@ module.exports = {
   normalizedTokens,
   parseCompanyUrl,
   parseDirectorsFromHtml,
+  parseDirectorsFromSearchResults,
   openDirectorInformation,
   tidyZaubaDesignation,
 };
