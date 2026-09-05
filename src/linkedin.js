@@ -63,7 +63,7 @@ function nameTokens(name) {
  */
 const MATCH_THRESHOLD = 10;
 
-function validateLinkedInCandidate(url, title, personName, companyName) {
+function validateLinkedInCandidate(url, title, personName, companyName, snippet = '') {
   if (!isPersonalProfileUrl(url)) return 0;
 
   // "K. Krithivasan" has only one non-initial token; fall back to including
@@ -81,9 +81,10 @@ function validateLinkedInCandidate(url, title, personName, companyName) {
   const slugParts = slug.split(/[-_.\d]+/).filter(Boolean);
 
   const titleLower = String(title || '').toLowerCase();
+  const employerText = `${titleLower} ${String(snippet || '').toLowerCase()}`;
   const companyToks = companyTokensOf(companyName);
   const companyMatch = companyToks.some(
-    (t) => titleLower.includes(t) || slugTight.includes(t)
+    (t) => employerText.includes(t) || slugTight.includes(t)
   );
 
   const meaningful = person.filter((t) => t.length >= 2);
@@ -112,8 +113,8 @@ function validateLinkedInCandidate(url, title, personName, companyName) {
   // real profiles have an abbreviated or custom slug (/in/vinod-n-8a4b21),
   // and rejecting those outright threw away matches a human reads straight
   // off the result: "Vinod Nahar - Chairman - Plasmagen Biosciences".
-  // The full name AND the employer both appearing in the title is at least
-  // as strong as a slug, so it is accepted as an alternative proof.
+  // The profile title must identify the person. Employer evidence may also
+  // come from the snippet, where search engines put the Experience section.
   if (!lastInSlug) {
     if (fullNameInTitle && companyMatch) return MATCH_THRESHOLD + 2;
     return 0;

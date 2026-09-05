@@ -17,6 +17,7 @@
 
 require('./env');
 const { chromium } = require('playwright');
+const { currentSearchConfig, noteSearchProvider } = require('./search-config');
 
 const SEARCH_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -257,6 +258,10 @@ const serperStatus = () => ({
 const SERPER_PAGE = Math.max(1, Math.min(20, Number(process.env.SERPER_NUM) || 10));
 
 async function runSerper(query, num = SERPER_PAGE, { retryOnPattern = true } = {}) {
+  // Protect every Serper entry point, including legacy connection probes.
+  if (currentSearchConfig().provider !== 'serper') {
+    throw new Error('Serper is disabled for the selected search provider');
+  }
   const res = await fetchWithTimeout(
     SERPER_ENDPOINT,
     {
@@ -294,6 +299,7 @@ async function runSerper(query, num = SERPER_PAGE, { retryOnPattern = true } = {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const data = await res.json();
+  serperOff = false;
   if (typeof data.credits === 'number') serperCredits = data.credits;
 
   const raw = [];
@@ -319,10 +325,66 @@ async function runSerper(query, num = SERPER_PAGE, { retryOnPattern = true } = {
  * twenty minutes later.
  */
 async function verifySerperKey() {
+  if (currentSearchConfig().provider !== 'serper') {
+    return { configured: Boolean(serperKey()), ok: false, skipped: true, error: 'Serper is disabled for the selected search provider' };
+  }
   if (!serperKey()) return { configured: false, ok: false, error: 'SERPER_API_KEY not set' };
   try {
     await runSerper('linkedin', 1);
     return { configured: true, ok: true, credits: serperCredits };
+  } catch (err) {
+    return { configured: true, ok: false, error: err.message };
+  }
+}
+
+/** Query the configured SearXNG instance's JSON API. */
+async function runSearxng(query, { engines = '' } = {}) {
+  const url = new URL(currentSearchConfig().searxngUrl);
+  url.searchParams.set('q', query);
+  url.searchParams.set('format', 'json');
+  // Supplying categories as well would add all category engines back in.
+  if (engines) url.searchParams.set('engines', engines);
+  else url.searchParams.set('categories', 'general');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': SEARCH_UA },
+    });
+    if (res.status === 403) {
+      throw new Error('HTTP 403: enable json in search.formats in your SearXNG settings.yml and check instance access');
+    }
+    if (res.status === 429) throw new Error('SearXNG rate limited (HTTP 429); retry later or use your own instance');
+    if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
+    let data;
+    try { data = await res.json(); } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      throw new Error('SearXNG did not return JSON. Enable json in search.formats in settings.yml');
+    }
+    if (!data || !Array.isArray(data.results)) throw new Error('Invalid SearXNG response: missing results array');
+    if (!data.results.length && data.unresponsive_engines?.length) {
+      const reasons = data.unresponsive_engines.map((entry) =>
+        Array.isArray(entry) ? entry.slice(0, 2).join(': ') : String(entry)).join('; ');
+      throw new Error(`SearXNG returned no results because upstream engines are unavailable (${reasons}); retry later`);
+    }
+    return toResults(data.results.filter((r) => r && typeof r.url === 'string').map((r) => ({
+      href: r.url, title: r.title || '', snippet: r.content || '',
+    })));
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('SearXNG timed out after 20 seconds');
+    if (err.message === 'fetch failed') throw new Error('Cannot reach SearXNG. Check the instance URL and that it is running');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifySearchProvider() {
+  if (currentSearchConfig().provider === 'serper') return verifySerperKey();
+  try {
+    await runSearxng('linkedin');
+    return { configured: true, ok: true };
   } catch (err) {
     return { configured: true, ok: false, error: err.message };
   }
@@ -449,31 +511,52 @@ async function runEngine(engine, encodedQuery) {
 const queryCache = new Map();
 const QUERY_CACHE_MAX = 500;
 
-async function searchWeb(query, { limit = 15, log = null } = {}) {
-  const cacheKey = query.toLowerCase().trim();
+async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } = {}) {
+  const config = currentSearchConfig();
+  const cacheKey = JSON.stringify([config.provider, config.provider === 'searxng' ? config.searxngUrl : '',
+    config.provider === 'searxng' ? searxngEngines : '', query.toLowerCase().trim()]);
   if (queryCache.has(cacheKey)) {
-    const hit = queryCache.get(cacheKey);
-    if (log) log(`      [cache] ${hit.length} result(s)`);
-    return hit.slice(0, limit);
+    const { results, source } = queryCache.get(cacheKey);
+    noteSearchProvider(source);
+    if (log) log(`      [cache: ${source}] ${results.length} result(s)`);
+    return results.slice(0, limit);
   }
 
   const encoded = encodeURIComponent(query);
   const constraints = queryConstraints(query);
   let lastRelevant = [];
 
-  const remember = (results) => {
+  const remember = (results, source = config.provider) => {
     if (queryCache.size >= QUERY_CACHE_MAX) {
       queryCache.delete(queryCache.keys().next().value);
     }
-    queryCache.set(cacheKey, results);
+    queryCache.set(cacheKey, { results, source });
     return results.slice(0, limit);
   };
 
-  // Serper is a Google API, not a scrape: it doesn't throttle us into serving
-  // cached pages for the wrong subject, so when the call succeeds its answer
-  // is final — including an empty one, which genuinely means "no such result"
-  // and is not worth re-asking three throttled scrapers about.
-  if (serperEnabled()) {
+  // A successful API response is final, including a valid empty result set.
+  // Provider failures may use scraped engines, but never the other paid API.
+  if (config.provider === 'searxng') {
+    const source = searxngEngines ? `searxng/${searxngEngines}` : 'searxng';
+    try {
+      if (log && searxngEngines) log(`      [${source}] searching: ${query}`);
+      const results = await runSearxng(query, { engines: searxngEngines });
+      const relevant = results.filter((r) => isRelevant(r, constraints, { trusted: true }));
+      if (log) log(`      [${source}] ${results.length} raw / ${relevant.length} relevant`);
+      noteSearchProvider(source);
+      return remember(relevant, source);
+    } catch (err) {
+      if (searxngEngines) {
+        if (log) log(`      [${source}] failed: ${err.message}`);
+        // Explicit Google-through-SearXNG lookups stay on that provider.
+        // Report provider failures instead of treating a CAPTCHA as no match.
+        throw err;
+      }
+      if (log) log(`      [searxng] failed: ${err.message}; trying scraped engines`);
+    }
+  }
+
+  if (config.provider === 'serper' && serperEnabled()) {
     try {
       const results = await runSerper(query);
       const relevant = results.filter((r) => isRelevant(r, constraints, { trusted: true }));
@@ -481,12 +564,14 @@ async function searchWeb(query, { limit = 15, log = null } = {}) {
         log(`      [serper] ${results.length} raw / ${relevant.length} relevant` +
             (serperCredits === null ? '' : ` (${serperCredits} credits left)`));
       }
+      noteSearchProvider('serper');
       return remember(relevant);
     } catch (err) {
       if (log) log(`      [serper] failed: ${err.message}`);
     }
   }
 
+  noteSearchProvider('scraped engines');
   for (const engine of ENGINES) {
     if (onCooldown(engine.name)) continue;
     try {
@@ -496,7 +581,7 @@ async function searchWeb(query, { limit = 15, log = null } = {}) {
 
       if (relevant.length > 0) {
         noteEngineOk(engine.name);
-        return remember(relevant);
+        return remember(relevant, 'scraped engines');
       }
       // A narrow site: query returning nothing is a normal, correct answer —
       // NOT engine failure. Benching on it used to knock out every engine in
@@ -526,14 +611,21 @@ async function searchWeb(query, { limit = 15, log = null } = {}) {
  * back NULL.
  */
 async function searchWithFallbackQueries(buildQueries, opts = {}) {
-  const { accept = null, minAccepted = 2, minResults = 5, log = null } = opts;
+  const { accept = null, minAccepted = 2, minResults = 5, log = null, searxngEngines = '' } = opts;
   const queries = buildQueries();
   const allSeen = new Map();
 
-  for (const q of queries) {
-    const results = await searchWeb(q, { log });
+  for (const [index, q] of queries.entries()) {
+    const results = await searchWeb(q, { log, searxngEngines });
     for (const r of results) {
-      if (!allSeen.has(r.url)) allSeen.set(r.url, r);
+      const previous = allSeen.get(r.url);
+      // A later query may expose the employer in a previously empty snippet.
+      // Keep that evidence instead of pinning the profile to its first hit.
+      if (!previous || (accept && accept(r) && !accept(previous)) ||
+          ((!accept || !accept(previous)) &&
+           `${r.title || ''} ${r.snippet || ''}`.length > `${previous.title || ''} ${previous.snippet || ''}`.length)) {
+        allSeen.set(r.url, r);
+      }
     }
 
     const values = [...allSeen.values()];
@@ -544,7 +636,9 @@ async function searchWithFallbackQueries(buildQueries, opts = {}) {
 
     // The pacing exists to keep scraped engines from throttling us. An API
     // key has no such problem, and the delay dominates the runtime.
-    if (!serperEnabled()) await sleep(600 + Math.random() * 900);
+    if (index < queries.length - 1 && (currentSearchConfig().provider !== 'serper' || !serperEnabled())) {
+      await sleep(600 + Math.random() * 900);
+    }
   }
   return [...allSeen.values()];
 }
@@ -559,4 +653,6 @@ module.exports = {
   serperEnabled,
   serperStatus,
   verifySerperKey,
+  verifySearchProvider,
+  runSearxng,
 };

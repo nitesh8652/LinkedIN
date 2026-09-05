@@ -1,18 +1,17 @@
 /**
  * ZaubaCorp fallback source.
  *
- * This module is only ever reached when the existing pipeline (website
- * discovery -> crawl -> extract -> search-snippet fallbacks) produced no
- * directors at all. It never runs alongside that flow, and nothing in
- * crawler.js / extract.js knows it exists.
+ * Used when the official website is missing or website research leaves
+ * directors without LinkedIn URLs. The registry supplies names; web search
+ * supplies the LinkedIn profile URLs.
  *
  * It does three things, each of which can fail with a stated reason:
  *
  *   1. locate the company's ZaubaCorp page (web search first, ZaubaCorp's own
  *      search endpoint second) and prove the page is about THIS company using
  *      normalized-token similarity, not a substring test;
- *   2. read the "Current Directors & Key Managerial Personnel" table off that
- *      page (falling back to the prose "Directors of X are A and B" line);
+ *   2. open #director-information ("Directors") and read its current director
+ *      tables, retaining registry details; support older layouts when absent;
  *   3. verify each name on LinkedIn with strict name+company rules, so a
  *      registry name is never written into the report attached to a stranger's
  *      profile.
@@ -43,7 +42,7 @@ const ZAUBA_SOURCE = 'ZaubaCorp';
 const WEBSITE_SOURCE = 'Official Website';
 
 const ZAUBA_HOST = 'www.zaubacorp.com';
-const MAX_DIRECTORS = 10;
+const DIRECTOR_SECTION = '#director-information';
 
 // Confidence bands for "is this ZaubaCorp page the company we asked about?"
 const MATCH_ACCEPT = 0.72;
@@ -293,12 +292,67 @@ async function closeZaubaBrowser() {
 const CHALLENGE_RE =
   /(performing security verification|checking your browser|just a moment|attention required|verify you are (a )?human|enable javascript and cookies)/i;
 
+/** Open the Directors accordion/tab before taking the HTML snapshot. */
+async function openDirectorInformation(page, log = () => {}) {
+  const opened = await page.evaluate(() => {
+    const section = document.getElementById('director-information');
+    let clicked = false;
+    const controls = [...document.querySelectorAll('button,a,[role="button"],summary')];
+    for (const control of controls) {
+      const label = (control.textContent || '').replace(/\s+/g, ' ').trim();
+      const target = control.getAttribute('data-bs-target') || control.getAttribute('data-target') ||
+        control.getAttribute('href') || (control.getAttribute('aria-controls') ? `#${control.getAttribute('aria-controls')}` : '');
+      const namedDirectors = /^Directors(?:\s+(?:of|and|&).*)?$/i.test(label);
+      if (target !== '#director-information' && !namedDirectors) continue;
+      // Only section controls, never a link to a different page or report.
+      if (target && !target.startsWith('#')) continue;
+      const panel = target.startsWith('#') ? document.getElementById(target.slice(1)) : section;
+      const details = control.closest('details');
+      const collapsed = control.getAttribute('aria-expanded') === 'false' ||
+        control.getAttribute('aria-selected') === 'false' ||
+        (details && !details.open) || (panel && getComputedStyle(panel).display === 'none');
+      if (collapsed || (namedDirectors && !section?.querySelector('table') && control.getAttribute('aria-expanded') !== 'true')) {
+        control.click();
+        clicked = true;
+      }
+    }
+    return { present: Boolean(section), clicked };
+  });
+
+  if (!opened.present && !opened.clicked) {
+    log('    ZaubaCorp #director-information not present; checking the older director layout');
+    return;
+  }
+  log('    opening ZaubaCorp Directors (#director-information)');
+  const section = page.locator(DIRECTOR_SECTION).first();
+  try {
+    await section.waitFor({ state: 'attached', timeout: 8000 });
+    await section.evaluate((element) => element.scrollIntoView({ block: 'start' }));
+    await page.waitForFunction(() => {
+      const section = document.getElementById('director-information');
+      if (!section) return false;
+      const content = [section];
+      if (section.matches('h1,h2,h3,h4,h5,h6,a')) {
+        let sibling = section.nextElementSibling;
+        while (sibling && !sibling.matches('h1,h2,h3,h4,h5,h6,section')) {
+          content.push(sibling);
+          sibling = sibling.nextElementSibling;
+        }
+      }
+      return content.some((element) => element.querySelector('tr td') ||
+        /no (?:current )?directors|directors? (?:information |details )?(?:not available|unavailable)/i.test(element.textContent || ''));
+    }, null, { timeout: 8000 });
+  } catch {
+    log('    ZaubaCorp Directors section did not populate before the timeout');
+  }
+}
+
 /**
  * Load a ZaubaCorp URL and return its HTML, or null with the reason logged.
  * Cloudflare serves an interstitial that resolves itself after a few seconds,
  * so a challenge is retried rather than treated as a dead end.
  */
-async function loadZaubaHtml(url, log, { attempts = 3 } = {}) {
+async function loadZaubaHtml(url, log, { attempts = 3, directors = false } = {}) {
   const page = await getZaubaPage();
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -320,6 +374,7 @@ async function loadZaubaHtml(url, log, { attempts = 3 } = {}) {
         log(`    ZaubaCorp returned HTTP ${status}`);
         return null;
       }
+      if (directors) await openDirectorInformation(page, log);
       return await page.content();
     } catch (err) {
       log(`    ZaubaCorp load failed (attempt ${attempt}): ${err.message}`);
@@ -348,8 +403,12 @@ async function searchZaubaCandidates(companyName, log) {
       `zaubacorp ${brand} company directors`,
     ],
     {
-      accept: (r) => Boolean(parseCompanyUrl(r.url)),
-      minAccepted: 3,
+      accept: (r) => {
+        const parsed = parseCompanyUrl(r.url);
+        return parsed && (matchCompanyName(companyName, parsed.nameFromSlug).accepted ||
+          matchCompanyName(companyName, r.title).accepted);
+      },
+      minAccepted: 1,
       log,
     }
   );
@@ -483,14 +542,14 @@ function headingAbove($, table) {
 
 /**
  * Extract directors from a ZaubaCorp company page.
- * Returns [{ name, designation, din, source }] — current appointments only.
+ * Returns current appointments with names, roles, DIN/DPIN and appointment dates.
  */
 function parseDirectorsFromHtml(html, companyName = '') {
   const $ = cheerio.load(html);
   const companyTokens = companyTokensOf(companyName);
   const found = new Map();
 
-  const push = (rawName, rawDesignation, din) => {
+  const push = (rawName, rawDesignation, din, appointmentDate = '') => {
     const name = cleanName(String(rawName || '').replace(/\s+/g, ' ').trim());
     if (!isValidPersonName(name, { companyTokens })) return;
     const key = nameKey(name);
@@ -499,23 +558,33 @@ function parseDirectorsFromHtml(html, companyName = '') {
       name,
       designation: tidyZaubaDesignation(rawDesignation),
       din: din || null,
+      appointmentDate: appointmentDate || null,
       source: ZAUBA_SOURCE,
     });
   };
 
-  $('table').each((_, table) => {
-    if (found.size >= MAX_DIRECTORS) return false;
+  const section = $(DIRECTOR_SECTION).first();
+  let tables = section.find('table').add(section.filter('table'));
+  // Some layouts put the fragment ID on the heading above the table.
+  if (section.is('h1,h2,h3,h4,h5,h6,a')) {
+    const content = section.nextUntil('h1,h2,h3,h4,h5,h6,section');
+    tables = tables.add(content.filter('table')).add(content.find('table'));
+  }
+  if (!section.length) tables = $('table');
+
+  tables.each((_, table) => {
 
     const headers = tableHeaders($, table);
     const headerLine = headers.join(' | ');
     // "Other Directorships of <person>" lists companies, not people.
     if (headerLine.includes('company name') || headerLine.includes('cin')) return undefined;
 
-    const nameCol = headers.findIndex((h) => /director name|^name$|dp name|partner name/.test(h));
+    const nameCol = headers.findIndex((h) => /\bname\b|^directors?$/.test(h));
     if (nameCol === -1) return undefined;
     const desigCol = headers.findIndex((h) => /designation|role/.test(h));
     const dinCol = headers.findIndex((h) => /^din|dpin/.test(h));
     const cessationCol = headers.findIndex((h) => /cessation|resign/.test(h));
+    const appointmentCol = headers.findIndex((h) => /appoint|joining/.test(h));
 
     // Past appointments sit in their own table under a "Past ..." heading and
     // also carry a cessation column. Either signal is enough to skip it.
@@ -523,30 +592,32 @@ function parseDirectorsFromHtml(html, companyName = '') {
     if (/\bpast\b|\bformer\b|\bresigned\b/.test(heading)) return undefined;
 
     $(table)
-      .find('tbody tr')
+      .find('tr')
       .each((_, tr) => {
-        if (found.size >= MAX_DIRECTORS) return false;
         const cells = $(tr)
-          .find('td')
+          .children('td')
           .toArray()
           .map((td) => ($(td).text() || '').replace(/\s+/g, ' ').trim());
         if (!cells.length || nameCol >= cells.length) return undefined;
         // A filled cessation date means the person has already left.
         if (cessationCol !== -1 && cessationCol < cells.length) {
           const ceased = cells[cessationCol];
-          if (ceased && ceased !== '-' && !/ongoing/i.test(ceased)) return undefined;
+          if (ceased && !/^(?:[-–—]|n\/?a|nil|none|not applicable|ongoing|present)$/i.test(ceased)) return undefined;
         }
         push(
           cells[nameCol],
           desigCol !== -1 && desigCol < cells.length ? cells[desigCol] : '',
-          dinCol !== -1 && dinCol < cells.length ? cells[dinCol] : ''
+          dinCol !== -1 && dinCol < cells.length ? cells[dinCol] : '',
+          appointmentCol !== -1 && appointmentCol < cells.length ? cells[appointmentCol] : ''
         );
         return undefined;
       });
     return undefined;
   });
 
-  if (found.size) return [...found.values()];
+  // An existing Directors section is authoritative, including an empty one.
+  // Do not replace it with stale prose or a similarly-shaped unrelated table.
+  if (section.length || found.size) return [...found.values()];
 
   // Fallback: the summary paragraph, which survives layout changes.
   // "Directors of TIMES COMTRADE PRIVATE LIMITED are JITENDRA ... and DILIP ..."
@@ -555,7 +626,6 @@ function parseDirectorsFromHtml(html, companyName = '') {
   if (m) {
     for (const part of m[1].split(/,|\band\b|&/i)) {
       push(part, 'Director', '');
-      if (found.size >= MAX_DIRECTORS) break;
     }
   }
   return [...found.values()];
@@ -612,10 +682,11 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
         `score ${best.match.score}) -> ${best.url}`
     );
 
-    const html = await loadZaubaHtml(best.url, log);
+    const pageUrl = `${best.url}${DIRECTOR_SECTION}`;
+    const html = await loadZaubaHtml(pageUrl, log, { directors: true });
     if (!html) {
       return fail('ZaubaCorp page could not be loaded', {
-        pageUrl: best.url,
+        pageUrl,
         matchedName: best.candidateName,
         confidence: best.match.confidence,
       });
@@ -624,7 +695,7 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
     const directors = parseDirectorsFromHtml(html, companyName);
     if (!directors.length) {
       return fail('Directors unavailable', {
-        pageUrl: best.url,
+        pageUrl,
         matchedName: best.candidateName,
         confidence: best.match.confidence,
       });
@@ -634,7 +705,7 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
     return {
       ok: true,
       directors: directors.map((d) => ({ ...d, companyName })),
-      pageUrl: best.url,
+      pageUrl,
       matchedName: best.candidateName,
       confidence: best.match.confidence,
       reason: '',
@@ -655,21 +726,31 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
 
 const LINKEDIN_MATCH_THRESHOLD = 10;
 
+// Google is the best source of registry-name profiles, but a self-hosted
+// SearXNG scraping it from one address draws a CAPTCHA within a few dozen
+// queries, and a suspended engine returns an empty set that reads as "no such
+// person". Bing rides along so a blocked Google degrades the results instead
+// of emptying them; SearXNG merges whichever engines answer.
+const LINKEDIN_SEARCH_ENGINES = 'google,bing';
+
 /** Company evidence in a result, split by where it was found. */
 function companyEvidence(result, companyName) {
-  const tokens = [
-    ...new Set([...companyTokensOf(companyName), ...brandTokens(companyName)]),
-  ].filter((t) => t.length >= 3);
+  const tokens = [...new Set(normalizedTokens(companyName))]
+    .filter((t) => t.length >= 3 && !GENERIC_TOKENS.has(t));
   if (!tokens.length) return { inTitle: false, inSnippet: false, tokens };
 
-  const tight = (s) => s.replace(/[^a-z0-9]/g, '');
-  const title = `${String(result.title || '')} ${String(result.url || '')}`.toLowerCase();
-  const snippet = String(result.snippet || '').toLowerCase();
+  const matches = (text) => {
+    const words = String(text || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(singularize);
+    const compact = words.join('');
+    // A shared word such as "Foods" must not tie an unrelated employer to
+    // this company, especially when a name-only result came from the cache.
+    return tokens.every((token) => words.includes(token)) || compact.includes(tokens.join(''));
+  };
 
   return {
     tokens,
-    inTitle: tokens.some((t) => title.includes(t) || tight(title).includes(t)),
-    inSnippet: tokens.some((t) => snippet.includes(t) || tight(snippet).includes(t)),
+    inTitle: matches(result.title) || matches(result.url),
+    inSnippet: matches(result.snippet),
   };
 }
 
@@ -685,21 +766,30 @@ function companyEvidence(result, companyName) {
 async function verifyDirectorOnLinkedIn(personName, companyName, designation, log = () => {}) {
   const brand = brandTokens(companyName).join(' ') || companyName;
   const role = designation || 'Director';
+  const name = cleanName(personName).replace(/\s+/g, ' ').trim();
+  const parts = name.split(' ');
+  // Registry names often include a middle/patronymic name that is absent
+  // from LinkedIn. Search both forms; keep the original name for validation.
+  const shortName = parts.length > 2 ? `${parts[0]} ${parts.at(-1)}` : name;
+  const names = [...new Set([name, shortName])];
 
-  // Company + person first (the query a human types), then the site:-scoped
-  // and role-qualified variations.
   const queries = [
-    `site:linkedin.com/in "${personName}" "${brand}"`,
-    `"${companyName}" "${personName}" LinkedIn`,
-    `"${companyName}" "${personName}" ${role} LinkedIn`,
-    `"${personName}" "${brand}" ${role} LinkedIn`,
-    `"${personName}" Managing Director "${brand}"`,
-    `site:linkedin.com/in "${personName}" ${brand}`,
+    // Start with the same broad search a person would type into Google.
+    ...names.map((n) => `${companyName.trim()} ${n}`),
+    ...names.map((n) => `${brand} ${n} LinkedIn`),
+    ...names.map((n) => `site:linkedin.com/in "${n}" "${brand}"`),
+    ...names.map((n) => `site:linkedin.com/in ${n} ${brand}`),
+    `"${shortName}" ${brand} ${role} LinkedIn`,
+    `"${shortName}" "${companyName}" LinkedIn`,
+    // A name-only search can surface Experience snippets omitted by a
+    // company-scoped query. Acceptance still requires employer evidence.
+    ...names.map((n) => `site:linkedin.com/in "${n}"`),
   ];
 
+  const score = (r) => validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet);
   const accept = (r) => {
     if (!isPersonalProfileUrl(r.url)) return false;
-    if (validateLinkedInCandidate(r.url, r.title, personName, companyName) < LINKEDIN_MATCH_THRESHOLD) {
+    if (score(r) < LINKEDIN_MATCH_THRESHOLD) {
       return false;
     }
     const evidence = companyEvidence(r, companyName);
@@ -709,6 +799,7 @@ async function verifyDirectorOnLinkedIn(personName, companyName, designation, lo
   const results = await searchWithFallbackQueries(() => queries, {
     accept,
     minAccepted: 1,
+    searxngEngines: LINKEDIN_SEARCH_ENGINES,
     log,
   });
 
@@ -725,7 +816,7 @@ async function verifyDirectorOnLinkedIn(personName, companyName, designation, lo
   const scored = profiles
     .map((r) => ({
       ...r,
-      score: validateLinkedInCandidate(r.url, r.title, personName, companyName),
+      score: score(r),
       evidence: companyEvidence(r, companyName),
     }))
     // Title evidence outranks snippet evidence at equal name confidence.
@@ -768,5 +859,6 @@ module.exports = {
   normalizedTokens,
   parseCompanyUrl,
   parseDirectorsFromHtml,
+  openDirectorInformation,
   tidyZaubaDesignation,
 };

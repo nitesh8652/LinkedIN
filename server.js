@@ -11,7 +11,8 @@ const { v4: uuidv4 } = require('uuid');
 
 const { readCompaniesFromExcel, writeResultsToExcel } = require('./src/excel');
 const { runAgent } = require('./src/agent');
-const { verifySerperKey } = require('./src/search');
+const { verifySearchProvider, serperStatus } = require('./src/search');
+const { resolveSearchConfig, withSearchConfig } = require('./src/search-config');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -39,10 +40,10 @@ const jobs = new Map();
 function createJob(jobId) {
   const job = {
     id: jobId,
-    status: 'queued', // queued | running | done | error
+    status: 'queued', // queued | running | finalizing | done | error
     logs: [],
     rows: [],
-    progress: { current: 0, total: 0, company: null },
+    progress: { current: 0, completed: 0, total: 0, company: null },
     meta: {},
     error: null,
     outputPath: null,
@@ -73,6 +74,10 @@ function createJob(jobId) {
         try { res.write(payload); } catch { /* dead listener */ }
       }
     },
+    closeListeners() {
+      for (const res of this.listeners) res.end();
+      this.listeners.clear();
+    },
     snapshot() {
       return {
         id: this.id,
@@ -97,6 +102,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.post('/api/upload', upload.single('excel'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const searchOptions = resolveSearchConfig({
+      provider: req.body.searchProvider,
+      searxngUrl: req.body.searxngUrl,
+    });
 
     const companies = await readCompaniesFromExcel(req.file.path).catch((err) => {
       throw new Error(`Invalid Excel file: ${err.message}`);
@@ -104,13 +113,16 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
 
     const jobId = uuidv4();
     const job = createJob(jobId);
+    job.progress.total = companies.length;
     job.log(`Parsed ${companies.length} companies from uploaded file`);
 
     // Run the agent in the background
     job.status = 'running';
     (async () => {
       try {
-        const rows = await runAgent(companies, job);
+        const rows = await runAgent(companies, job, searchOptions);
+        job.status = 'finalizing';
+        job.broadcast({ type: 'state', state: job.snapshot() });
         const outName = `report-${jobId.slice(0, 8)}.xlsx`;
         const outPath = path.join(OUTPUT_DIR, outName);
         await writeResultsToExcel(rows, outPath, {
@@ -132,6 +144,7 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
         job.log(`FATAL: ${err.message}`);
       }
       job.broadcast({ type: 'state', state: job.snapshot() });
+      job.closeListeners();
     })();
 
     res.json({ jobId, companiesFound: companies.length, companies: companies.slice(0, 50) });
@@ -140,23 +153,28 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
   }
 });
 
-// Lightweight probe the frontend calls on load to toast whether the Serper
-// key is usable. Cached briefly so repeated page loads don't each burn a
-// Serper credit.
-let serperCheckCache = null; // { at: number, result: object }
-const SERPER_CHECK_TTL = 5 * 60 * 1000;
-
-app.get('/api/serper-check', async (req, res) => {
+// Configuration reads never spend search credits. Connection tests are explicit.
+app.get('/api/search-config', (req, res) => {
   try {
-    if (serperCheckCache && Date.now() - serperCheckCache.at < SERPER_CHECK_TTL) {
-      return res.json({ ...serperCheckCache.result, cached: true });
-    }
-    const result = await verifySerperKey();
-    serperCheckCache = { at: Date.now(), result };
-    res.json(result);
+    res.json({ ...resolveSearchConfig(), serper: serperStatus() });
   } catch (err) {
-    res.status(500).json({ configured: true, ok: false, error: err.message });
+    res.status(400).json({ error: err.message });
   }
+});
+
+app.post('/api/search-check', async (req, res) => {
+  let config;
+  try { config = resolveSearchConfig(req.body); } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+  const result = await withSearchConfig(config, () => verifySearchProvider());
+  res.json({ provider: config.provider, ...result });
+});
+
+app.get('/api/serper-check', (req, res) => {
+  // Older tabs called this automatically, spending Serper credits even
+  // during SearXNG jobs. Only the explicit provider-aware POST may probe.
+  res.json({ ...serperStatus(), ok: null, skipped: true, message: 'Use POST /api/search-check to test the selected provider' });
 });
 
 app.get('/api/status/:jobId', (req, res) => {
@@ -177,10 +195,11 @@ app.get('/api/events/:jobId', (req, res) => {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
-  // Replay existing state
-  res.write(`data: ${JSON.stringify({ type: 'state', state: job.snapshot() })}\n\n`);
+  // Replay data before a terminal state tells the client to close its stream.
   res.write(`data: ${JSON.stringify({ type: 'logs', lines: job.logs })}\n\n`);
   res.write(`data: ${JSON.stringify({ type: 'rows', rows: job.rows })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'state', state: job.snapshot() })}\n\n`);
+  if (job.status === 'done' || job.status === 'error') return res.end();
   job.listeners.add(res);
   req.on('close', () => job.listeners.delete(res));
 });
@@ -204,6 +223,10 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-app.listen(PORT, () => {
-  console.log(`AI Company Research Agent running at http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`AI Company Research Agent running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;

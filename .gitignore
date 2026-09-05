@@ -3,3 +3,6 @@ node_modules/
 uploads/
 outputs/
 *.log
+
+# Local SearXNG instance config; settings.yml holds a generated secret_key.
+searxng/

@@ -20,6 +20,23 @@
     <!-- Upload card -->
     <section class="card" id="uploadCard">
       <h2>1. Upload Excel File</h2>
+      <div class="search-settings">
+        <p id="providerLabel" class="field-label">Search provider</p>
+        <div class="provider-switch" role="group" aria-labelledby="providerLabel">
+          <button type="button" class="provider-button" data-provider="serper" aria-pressed="true">Serper <span>Uses API credits</span></button>
+          <button type="button" class="provider-button" data-provider="searxng" aria-pressed="false">SearXNG <span>No Serper credits</span></button>
+        </div>
+        <div id="searxngSettings" class="hidden">
+          <label for="searxngUrl" class="field-label">SearXNG instance URL</label>
+          <input id="searxngUrl" type="url" placeholder="http://localhost:8080" aria-describedby="searxngHint" />
+          <p id="searxngHint" class="hint">Use a running SearXNG instance with JSON search enabled. <a href="https://docs.searxng.org/dev/search_api.html" target="_blank" rel="noopener noreferrer">Setup requirements</a></p>
+        </div>
+        <div class="provider-status-row">
+          <p id="searchStatus" class="hint" role="status">Loading search settings...</p>
+          <button type="button" id="checkSearchBtn" class="check-search" disabled>Test connection</button>
+        </div>
+        <p class="hint">Your selection is saved for future uploads. Running jobs keep their selected provider.</p>
+      </div>
       <div
         id="dropZone"
         class="drop-zone"
@@ -53,6 +70,7 @@
     <!-- Status card -->
     <section class="card hidden" id="statusCard">
       <h2>2. Processing Status</h2>
+      <p id="jobSearchProvider" class="hint"></p>
 
       <div class="progress-wrap">
         <div class="progress-track">
@@ -105,6 +123,8 @@
               <th>LinkedIn URL</th>
               <th>Source</th>
               <th>Status</th>
+              <th>DIN / DPIN</th>
+              <th>Appointment Date</th>
             </tr>
           </thead>
           <tbody></tbody>

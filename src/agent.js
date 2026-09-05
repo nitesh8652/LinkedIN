@@ -7,9 +7,9 @@ const {
   searchWeb,
   searchWithFallbackQueries,
   closeSearchBrowser,
-  serperStatus,
-  verifySerperKey,
+  verifySearchProvider,
 } = require('./search');
+const { withSearchConfig, currentSearchConfig, searchProviderLabel, noteSearchProvider } = require('./search-config');
 const { findOfficialWebsiteWithQueries } = require('./discover');
 const { crawlWebsiteForLeaders } = require('./crawler');
 const { extractLeaders } = require('./extract');
@@ -142,17 +142,15 @@ function zaubaStatusFor(reason) {
 }
 
 /**
- * Fallback source of last resort: the MCA registry via ZaubaCorp.
- *
- * Only reached when the existing pipeline found nobody at all — no official
- * website, or a website that named no leadership. Each registry name is put
- * through LinkedIn verification before it is allowed into the report.
+ * Use registry names when the official website is missing, no directors are
+ * named, or a director's LinkedIn lookup failed. Search each registry name
+ * together with the company, then validate the returned profile URL.
  */
 async function directorsFromZaubaCorp(companyName, log, nullRow) {
   const zauba = await findDirectorsOnZaubaCorp(companyName, log);
 
   if (!zauba.ok) {
-    log(`ZaubaCorp fallback failed: ${zauba.reason} -> NULL row`);
+    log(`ZaubaCorp fallback failed: ${zauba.reason}`);
     return nullRow(zaubaStatusFor(zauba.reason), ZAUBA_SOURCE);
   }
 
@@ -162,7 +160,7 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
   );
 
   const rows = [];
-  for (const person of zauba.directors.slice(0, MAX_PEOPLE_PER_COMPANY)) {
+  for (const person of zauba.directors) {
     const designation = person.designation || 'Director';
     log(`verifying ${person.name} (${designation}) on LinkedIn`);
 
@@ -186,11 +184,38 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
       personName: person.name,
       designation,
       linkedinUrl: verdict.url,
+      din: person.din || null,
+      appointmentDate: person.appointmentDate || null,
+      sourceUrl: zauba.pageUrl || null,
       status,
       source: ZAUBA_SOURCE,
     });
   }
   return rows;
+}
+
+/** Enrich missing matches without dropping website results or duplicating people. */
+function mergeDirectorRows(rows, registryRows) {
+  const merged = [...rows];
+  for (const registry of registryRows) {
+    if (!registry.personName) continue;
+    const index = merged.findIndex((row) =>
+      nameKey(row.personName) === nameKey(registry.personName) ||
+      (row.linkedinUrl && row.linkedinUrl === registry.linkedinUrl));
+    if (index === -1) {
+      merged.push(registry);
+      continue;
+    }
+    const previous = merged[index];
+    merged[index] = {
+      ...previous,
+      ...registry,
+      linkedinUrl: previous.linkedinUrl || registry.linkedinUrl,
+      status: previous.linkedinUrl ? previous.status : registry.status,
+      source: previous.linkedinUrl ? previous.source : registry.source,
+    };
+  }
+  return merged;
 }
 
 async function processCompany(companyName, job) {
@@ -224,6 +249,12 @@ async function processCompany(companyName, job) {
     );
 
     let leaders = [];
+    let registryRows = null;
+    // One registry lookup per company, even when later fallbacks also miss.
+    const lookupRegistry = async () => {
+      if (!registryRows) registryRows = await directorsFromZaubaCorp(companyName, log, nullRow);
+      return registryRows;
+    };
 
     if (website) {
       log(`official website: ${website.url}`);
@@ -236,7 +267,10 @@ async function processCompany(companyName, job) {
         log(`crawl error (${err.message}) -> trying LinkedIn fallback`);
       }
     } else {
-      log('official website not found -> trying LinkedIn fallback');
+      log('official website not found -> ZaubaCorp director-name fallback');
+      const rows = await lookupRegistry();
+      if (rows.some((row) => row.personName)) return rows;
+      log('ZaubaCorp directors unavailable -> trying LinkedIn search fallbacks');
     }
 
     // The fallbacks used to be reachable only on a completely empty crawl, so
@@ -269,17 +303,14 @@ async function processCompany(companyName, job) {
       merge(await leadersFromWebSnippets(companyName, log));
     }
 
-    // Everything above is the existing flow, untouched. ZaubaCorp is reached
-    // only once that flow has produced nobody — either because no official
-    // website was found, or because the one that was found named no leaders.
-    // A company with valid directors never gets here.
+    // Registry names also cover a website that never names its directors.
     if (leaders.length === 0) {
       log(
         website
           ? 'website found but no directors extracted -> ZaubaCorp fallback'
           : 'official website not found -> ZaubaCorp fallback'
       );
-      return directorsFromZaubaCorp(companyName, log, nullRow);
+      return await lookupRegistry();
     }
 
     // Untitled names scraped off a homepage exist only to avoid an empty
@@ -322,6 +353,10 @@ async function processCompany(companyName, job) {
         source: WEBSITE_SOURCE,
       });
     }
+    if (rows.some((row) => !row.linkedinUrl)) {
+      log('director LinkedIn URL missing -> ZaubaCorp director-name fallback');
+      return mergeDirectorRows(rows, await lookupRegistry());
+    }
     return rows;
   } catch (err) {
     log(`unexpected error: ${err.message} -> NULL row`);
@@ -333,43 +368,51 @@ async function processCompany(companyName, job) {
  * Process the full company list sequentially with human-like pacing.
  * Calls job.onRow(row) as each final row is produced.
  */
-async function runAgent(companies, job) {
+function runAgent(companies, job, searchOptions = {}) {
+  return withSearchConfig(searchOptions, () => runAgentWithProvider(companies, job));
+}
+
+async function runAgentWithProvider(companies, job) {
   job.log(`LLM layer: ${llmEnabled() ? 'ENABLED' : 'disabled (heuristic mode)'}`);
 
   // Prove the search backend works before spending an hour discovering it
   // doesn't. A dead backend is the difference between a full report and a
   // sheet of NULLs, so it is worth saying so loudly and up front.
-  const check = await verifySerperKey();
+  const check = await verifySearchProvider();
+  const provider = currentSearchConfig().provider;
   if (check.ok) {
-    job.log(`Search: Serper (Google API) OK${check.credits === null ? '' : ` — ${check.credits} credits left`}`);
-  } else if (check.configured) {
-    job.log(`!! Serper key REJECTED: ${check.error}`);
-    job.log('!! Falling back to scraped engines, which are heavily throttled — expect mostly NULL rows.');
+    job.log(`Search: ${searchProviderLabel()} OK${check.credits == null ? '' : ` — ${check.credits} credits left`}`);
+  } else if (provider === 'searxng') {
+    throw new Error(`SearXNG connection failed: ${check.error}`);
   } else {
-    job.log('!! No SERPER_API_KEY set — using scraped engines only. Expect mostly NULL rows.');
+    job.log(`!! Serper unavailable: ${check.error}. Using scraped fallback engines.`);
+    noteSearchProvider('scraped engines');
   }
 
-  const serper = serperStatus();
   job.setMeta({
     total: companies.length,
     llmEnabled: llmEnabled(),
-    searchProvider: serper.active ? 'Serper (Google API)' : 'scraped engines (Serper unavailable)',
+    searchProvider: searchProviderLabel(),
   });
 
   const allRows = [];
   try {
     for (let i = 0; i < companies.length; i++) {
       const company = companies[i];
-      job.setProgress({ current: i + 1, company });
+      job.setProgress({ current: i + 1, completed: i, company });
       const rows = await processCompany(company, job);
       for (const r of rows) {
         allRows.push(r);
         job.onRow(r);
       }
-      // human-like delay between companies
-      await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+      job.setProgress({ current: i + 1, completed: i + 1, company: null });
+      // Pace only between companies; the final result can finish immediately.
+      if (i < companies.length - 1) {
+        await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+      }
     }
   } finally {
+    job.setMeta({ searchProvider: searchProviderLabel() });
     await closeSearchBrowser();
     await closeZaubaBrowser();
   }
