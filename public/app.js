@@ -348,6 +348,7 @@ const STATUS_LABELS = {
   ok: 'Found',
   ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
+  search_unavailable: 'Search temporarily unavailable',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',
@@ -396,7 +397,9 @@ function addResultRow(row) {
     sourceCell.replaceChildren(sourceLink);
   }
   tr.appendChild(sourceCell);
-  tr.appendChild(makeCell(STATUS_LABELS[row.status] || row.status || ''));
+  const statusCell = makeCell(STATUS_LABELS[row.status] || row.status || '');
+  if (row.reason) statusCell.title = row.reason;
+  tr.appendChild(statusCell);
   tr.appendChild(makeCell(row.din));
   tr.appendChild(makeCell(row.appointmentDate));
 
@@ -543,8 +546,11 @@ checkSearchBtn.addEventListener('click', async () => {
     const data = await res.json();
     if (revision !== settingsRevision) return;
     if (!res.ok || !data.ok) throw new Error(data.error || 'Connection failed');
-    const message = `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connection is working${data.credits == null ? '' : ` (${data.credits} credits left)`}`;
-    setSearchStatus(message, 'ok');
+    const warnings = data.warnings || [];
+    const message = warnings.length
+      ? `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connected with limited engines (${warnings.join('; ')})`
+      : `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connection is working${data.credits == null ? '' : ` (${data.credits} credits left)`}`;
+    setSearchStatus(message, warnings.length ? 'warning' : 'ok');
     showToast(message, true);
   } catch (err) {
     if (revision === settingsRevision) setSearchStatus(err.message, 'error');

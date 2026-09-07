@@ -352,14 +352,58 @@ async function verifySerperKey() {
   }
 }
 
-/** Query the configured SearXNG instance's JSON API. */
+// Keep suspension state per instance. Repeating the same CAPTCHA request for
+// each name cannot recover it and used to flood a job with identical errors.
+const searxngSuspensions = new Map();
+const searxngWarnings = new WeakMap();
+
+function searxngState() {
+  const instance = currentSearchConfig().searxngUrl;
+  if (!searxngSuspensions.has(instance)) searxngSuspensions.set(instance, new Map());
+  return searxngSuspensions.get(instance);
+}
+
+function warnSearxngOnce(engine, reason, log) {
+  if (!log) return;
+  const config = currentSearchConfig();
+  if (!searxngWarnings.has(config)) searxngWarnings.set(config, new Set());
+  const warnings = searxngWarnings.get(config);
+  const key = `${engine}:${reason}`;
+  if (warnings.has(key)) return;
+  warnings.add(key);
+  log(`      [searxng] ${engine}: ${reason}; temporarily skipping this engine`);
+}
+
+function searchUnavailable(message) {
+  const error = new Error(message);
+  error.code = 'SEARCH_UNAVAILABLE';
+  return error;
+}
+
+function unavailableEngines(blocked, retryWithRemainingEngines = false) {
+  const details = blocked.map(([engine, state]) => `${engine}: ${state.reason}`).join('; ');
+  const error = searchUnavailable(`SearXNG upstream engines temporarily unavailable (${details}). No relevant results from the remaining engines; retry after recovery or use another working SearXNG instance`);
+  error.retryWithRemainingEngines = retryWithRemainingEngines;
+  return error;
+}
+
+/** Query only web engines; general categories also include Wikipedia, etc. */
 async function runSearxng(query, { engines = '', log = null } = {}) {
   const url = new URL(currentSearchConfig().searxngUrl);
+  const requested = [...new Set(String(engines || process.env.SEARXNG_ENGINES || 'google,bing')
+    .split(',').map((engine) => engine.trim()).filter(Boolean))];
+  const state = searxngState();
+  for (const [engine, suspension] of state) {
+    if (suspension.until <= Date.now()) state.delete(engine);
+  }
+  const blocked = requested.filter((engine) => state.has(engine));
+  for (const engine of blocked) warnSearxngOnce(engine, state.get(engine).reason, log);
+  const active = requested.filter((engine) => !state.has(engine));
+  if (!active.length) throw unavailableEngines(blocked.map((engine) => [engine, state.get(engine)]));
   url.searchParams.set('q', query);
   url.searchParams.set('format', 'json');
   // Supplying categories as well would add all category engines back in.
-  if (engines) url.searchParams.set('engines', engines);
-  else url.searchParams.set('categories', 'general');
+  url.searchParams.set('engines', active.join(','));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
@@ -388,11 +432,20 @@ async function runSearxng(query, { engines = '', log = null } = {}) {
       const [result] = toResults([{ href: r.url, title: r.title, snippet: r.content }]);
       return result && isRelevant(result, constraints, { minTokenCoverage: 0.6 });
     }).map((r) => ({ href: r.url, title: r.title || '', snippet: r.content || '' })));
-    if (data.unresponsive_engines?.length) {
-      const details = data.unresponsive_engines.map((entry) =>
-        Array.isArray(entry) ? entry.slice(0, 2).join(': ') : String(entry)).join('; ');
-      if (log) log(`      [searxng] unavailable engines: ${details}`);
-      if (!results.length) throw new Error(`SearXNG returned no results because upstream engines are unavailable (${details}); retry later`);
+    for (const entry of data.unresponsive_engines || []) {
+      if (!Array.isArray(entry) || !active.includes(entry[0])) continue;
+      const [engine, rawReason] = entry;
+      const reason = String(rawReason || 'unavailable').replace(/^Suspended:\s*/i, '');
+      // These mirror ordinary CAPTCHA/rate-limit defaults in the installed
+      // instance. SearXNG remains responsible for its own suspension window.
+      const delay = /captcha/i.test(reason) ? 60 * 60 * 1000
+        : /too many requests|access denied|HTTP 4[02][39]/i.test(reason) ? 180000 : 60000;
+      state.set(engine, { reason, until: Date.now() + delay });
+      warnSearxngOnce(engine, reason, log);
+    }
+    const unavailable = requested.filter((engine) => state.has(engine));
+    if (!results.length && unavailable.length) {
+      throw unavailableEngines(unavailable.map((engine) => [engine, state.get(engine)]), unavailable.length < requested.length);
     }
     return results;
   } catch (err) {
@@ -409,7 +462,9 @@ async function verifySearchProvider() {
   try {
     const results = await runSearxng('linkedin');
     if (!results.length) throw new Error('SearXNG returned no search results for the connection check; check that its search engines are working');
-    return { configured: true, ok: true };
+    const warnings = [...searxngState()].filter(([, state]) => state.until > Date.now())
+      .map(([engine, state]) => `${engine}: ${state.reason}`);
+    return { configured: true, ok: true, ...(warnings.length ? { warnings } : {}) };
   } catch (err) {
     return { configured: true, ok: false, error: err.message };
   }
@@ -552,6 +607,7 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
   const encoded = encodeURIComponent(query);
   const constraints = queryConstraints(query);
   let lastRelevant = [];
+  let providerFailure = null;
 
   const remember = (results, source = config.provider) => {
     // Empty or filtered-out results must be retried after engines recover.
@@ -575,12 +631,14 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
       noteSearchProvider(source);
       return remember(relevant, source);
     } catch (err) {
+      // A suspended upstream engine is an incomplete search, not proof that
+      // a director/profile does not exist. The caller may try another query
+      // on remaining healthy engines, without launching scraper loops.
+      if (err.code === 'SEARCH_UNAVAILABLE') throw err;
       if (searxngEngines) {
-        if (log) log(`      [${source}] failed: ${err.message}`);
-        // Explicit Google-through-SearXNG lookups stay on that provider.
-        // Leave failures uncached so a later query can retry.
-        return [];
+        throw searchUnavailable(`SearXNG search temporarily unavailable: ${err.message}`);
       }
+      providerFailure = err;
       if (log) log(`      [searxng] failed: ${err.message}; trying scraped engines`);
     }
   }
@@ -627,6 +685,7 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
   }
   // Don't cache emptiness: a transient block must not pin this query to NULL
   // for the rest of the process.
+  if (providerFailure) throw searchUnavailable(`SearXNG and its search fallbacks are temporarily unavailable: ${providerFailure.message}`);
   return lastRelevant.slice(0, limit);
 }
 
@@ -643,9 +702,18 @@ async function searchWithFallbackQueries(buildQueries, opts = {}) {
   const { accept = null, minAccepted = 2, minResults = 5, log = null, searxngEngines = '' } = opts;
   const queries = buildQueries();
   const allSeen = new Map();
+  let unavailable = null;
 
   for (const [index, q] of queries.entries()) {
-    const results = await searchWeb(q, { log, searxngEngines });
+    let results;
+    try {
+      results = await searchWeb(q, { log, searxngEngines });
+    } catch (err) {
+      if (err.code !== 'SEARCH_UNAVAILABLE') throw err;
+      unavailable = err;
+      if (!err.retryWithRemainingEngines) break;
+      results = [];
+    }
     for (const r of results) {
       const previous = allSeen.get(r.url);
       // A later query may expose the employer in a previously empty snippet.
@@ -669,7 +737,9 @@ async function searchWithFallbackQueries(buildQueries, opts = {}) {
       await sleep(600 + Math.random() * 900);
     }
   }
-  return [...allSeen.values()];
+  const values = [...allSeen.values()];
+  if (unavailable && !values.some(accept || (() => true))) throw unavailable;
+  return values;
 }
 
 module.exports = {

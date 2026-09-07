@@ -75,6 +75,7 @@ const STATUS_LABELS = {
   ok: 'Found',
   ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
+  search_unavailable: 'Search temporarily unavailable',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',

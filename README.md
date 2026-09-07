@@ -25,11 +25,14 @@ Optional `.env` defaults (merge these into your existing file):
 ```dotenv
 SEARCH_PROVIDER=searxng
 SEARXNG_URL=http://localhost:8080
+SEARXNG_ENGINES=google,bing
 ```
 
 Both the base instance URL and its `/search` URL are accepted, including deployments under a path prefix. An unavailable SearXNG instance stops a job at its initial connection check with a setup error. Later search failures use the existing scraped engines and are logged, without switching to Serper.
 
-The connection check requires actual search results; an empty JSON response is not treated as a working engine. Upstream CAPTCHA and timeout messages appear in the log. Empty searches are retried on later runs, and successful cached results expire after ten minutes.
+The connection check requires actual search results; an empty JSON response is not treated as a working engine. Only the configured web engines run, so unrelated Wikipedia failures do not affect company lookups. Engine warnings appear in the connection check and job log when results may be incomplete. Empty searches are retried on later runs, and successful cached results expire after ten minutes.
+
+When an upstream engine reports CAPTCHA or a timeout, the app temporarily skips it and tries the remaining engines. It logs the suspension once per job. If the remaining searches cannot produce a match, rows retain their known names and show **Search temporarily unavailable** instead of **No LinkedIn match**. Google CAPTCHA is an upstream restriction: the app does not clear SearXNG's suspension state. Retry after recovery or select another working SearXNG instance. `SEARXNG_ENGINES` can list other general web engines supported by that instance.
 
 The legacy `GET /api/serper-check` endpoint only reports configuration; it no longer makes a paid request. Use the **Test connection** button (`POST /api/search-check`) to test the selected provider explicitly.
 
@@ -38,6 +41,8 @@ When ZaubaCorp is used, a matching SearXNG result opens the company page at `#di
 If the company page cannot be loaded or has no Directors section, the agent can recover explicitly named directors from indexed ZaubaCorp company summaries and current director associations. These rows are marked **ZaubaCorp (search result)** and link to the indexed source. A present empty Directors section is never replaced with indexed names.
 
 The results retain DIN/DPIN numbers and appointment dates, and the ZaubaCorp source link opens the Directors section. These details and the source URL are included in the Excel report. LinkedIn lookups try both registry names and names without middle names; a URL is returned only when the result supports both the person's identity and company, including company information in the snippet. Unverified URLs are shown as `NULL`.
+
+Website and registry names both use plain company-plus-name queries before narrower LinkedIn searches. A longer LinkedIn name such as **Sethu Madhavan Sankaran** can match the website's **Sethu Madhavan** when the profile also identifies PlasmaGen Biosciences.
 
 Progress counts completed companies and reaches 100% when the Excel report is ready. Event streaming and fallback polling stop on completion, cancellation, or failure; polling snapshots replace previous rows and logs without duplicating them.
 

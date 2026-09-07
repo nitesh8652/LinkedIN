@@ -91,7 +91,7 @@ test('explicit Google requests are routed through SearXNG and cached separately 
     const url = new URL(input);
     requests.push(url);
     return json({ results: [{
-      url: url.searchParams.has('engines') ? 'https://google-result.test/profile' : 'https://default-result.test/profile',
+      url: url.searchParams.get('engines') === 'google' ? 'https://google-result.test/profile' : 'https://default-result.test/profile',
       title: 'Director profile',
     }] });
   });
@@ -104,6 +104,7 @@ test('explicit Google requests are routed through SearXNG and cached separately 
   assert.equal(requests.length, 2);
   assert.ok(requests.every((url) => url.origin === 'http://localhost:8080'));
   assert.equal(requests[1].searchParams.get('engines'), 'google');
+  assert.equal(requests[0].searchParams.get('engines'), 'google,bing');
   assert.equal(requests[1].searchParams.has('categories'), false, 'categories would add other engines to the Google search');
 });
 
@@ -114,7 +115,7 @@ test('Google-through-SearXNG failure cannot switch to Serper or direct scrapers'
     return new Response('', { status: 503 });
   });
   await withSearchConfig(sx, async () => {
-    assert.deepEqual(await searchWeb('Google provider failure test', { searxngEngines: 'google' }), []);
+    await assert.rejects(searchWeb('Google provider failure test', { searxngEngines: 'google' }), { code: 'SEARCH_UNAVAILABLE' });
   });
   assert.deepEqual(origins, ['http://localhost:8080']);
 });
@@ -136,9 +137,9 @@ test('connection check reports access, rate limit, invalid JSON and upstream fai
     assert.equal(new URL(input).hostname, 'localhost');
     return respond();
   });
-  for (const [response, error] of cases) {
+  for (const [index, [response, error]] of cases.entries()) {
     respond = response;
-    const check = await withSearchConfig(sx, verifySearchProvider);
+    const check = await withSearchConfig({ ...sx, searxngUrl: `http://localhost:8080/check-${index}` }, verifySearchProvider);
     assert.equal(check.ok, false);
     assert.match(check.error, error);
   }

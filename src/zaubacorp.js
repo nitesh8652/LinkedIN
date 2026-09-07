@@ -797,7 +797,7 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
       reason: '',
     };
   } catch (err) {
-    return fail(`ZaubaCorp lookup error: ${err.message}`);
+    return fail(`ZaubaCorp lookup error: ${err.message}`, { errorCode: err.code });
   }
 }
 
@@ -817,7 +817,7 @@ const LINKEDIN_MATCH_THRESHOLD = 10;
 // queries, and a suspended engine returns an empty set that reads as "no such
 // person". Bing rides along so a blocked Google degrades the results instead
 // of emptying them; SearXNG merges whichever engines answer.
-const LINKEDIN_SEARCH_ENGINES = 'google,bing';
+const LINKEDIN_SEARCH_ENGINES = process.env.SEARXNG_ENGINES || 'google,bing';
 
 /** Company evidence in a result, split by where it was found. */
 function companyEvidence(result, companyName) {

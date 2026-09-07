@@ -34,6 +34,7 @@ const {
 } = require('./person');
 
 const MAX_PEOPLE_PER_COMPANY = 8;
+const isSearchUnavailable = (error) => error?.code === 'SEARCH_UNAVAILABLE';
 
 /**
  * Last-resort discovery: read names straight out of LinkedIn search-result
@@ -151,6 +152,9 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
 
   if (!zauba.ok) {
     log(`ZaubaCorp fallback failed: ${zauba.reason}`);
+    if (zauba.errorCode === 'SEARCH_UNAVAILABLE') {
+      return nullRow('search_unavailable', ZAUBA_SOURCE, zauba.reason);
+    }
     return nullRow(zaubaStatusFor(zauba.reason), ZAUBA_SOURCE);
   }
 
@@ -160,14 +164,16 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
   );
 
   const rows = [];
+  let searchUnavailable = null;
   for (const person of zauba.directors) {
     const designation = person.designation || 'Director';
     log(`verifying ${person.name} (${designation}) on LinkedIn`);
 
     let verdict = { url: null, confidence: 'none', reason: 'LinkedIn verification failed' };
     try {
-      verdict = await verifyDirectorOnLinkedIn(person.name, companyName, designation, log);
+      if (!searchUnavailable) verdict = await verifyDirectorOnLinkedIn(person.name, companyName, designation, log);
     } catch (err) {
+      if (isSearchUnavailable(err)) searchUnavailable = err;
       verdict = {
         url: null,
         confidence: 'none',
@@ -176,7 +182,7 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
       log(`LinkedIn verification error: ${err.message}`);
     }
 
-    let status = 'linkedin_unverified';
+    let status = searchUnavailable ? 'search_unavailable' : 'linkedin_unverified';
     if (verdict.url) status = verdict.confidence === 'medium' ? 'ok_medium' : 'ok';
 
     rows.push({
@@ -189,6 +195,7 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
       sourceUrl: person.sourceUrl || zauba.pageUrl || null,
       status,
       source: person.source || ZAUBA_SOURCE,
+      ...(searchUnavailable && !verdict.url ? { reason: searchUnavailable.message } : {}),
     });
   }
   return rows;
@@ -196,7 +203,10 @@ async function directorsFromZaubaCorp(companyName, log, nullRow) {
 
 /** Enrich missing matches without dropping website results or duplicating people. */
 function mergeDirectorRows(rows, registryRows) {
-  const merged = [...rows];
+  const unavailable = registryRows.find((row) => row.status === 'search_unavailable');
+  const merged = rows.map((row) => !row.linkedinUrl && unavailable
+    ? { ...row, status: 'search_unavailable', reason: unavailable.reason }
+    : row);
   for (const registry of registryRows) {
     if (!registry.personName) continue;
     const index = merged.findIndex((row) =>
@@ -249,13 +259,14 @@ function pauseBetweenCompanies(job) {
 
 async function processCompany(companyName, job) {
   const log = (msg) => job.log(`[${companyName}] ${msg}`);
-  const nullRow = (status, source = WEBSITE_SOURCE) => [{
+  const nullRow = (status, source = WEBSITE_SOURCE, reason = null) => [{
     companyName,
     personName: null,
     designation: null,
     linkedinUrl: null,
     status,
     source,
+    ...(reason ? { reason } : {}),
   }];
 
   try {
@@ -278,6 +289,7 @@ async function processCompany(companyName, job) {
     );
 
     let leaders = [];
+    let searchUnavailable = null;
     let registryRows = null;
     // One registry lookup per company, even when later fallbacks also miss.
     const lookupRegistry = async () => {
@@ -298,7 +310,7 @@ async function processCompany(companyName, job) {
     } else {
       log('official website not found -> ZaubaCorp director-name fallback');
       const rows = await lookupRegistry();
-      if (rows.some((row) => row.personName)) return rows;
+      if (rows.some((row) => row.personName || row.status === 'search_unavailable')) return rows;
       log('ZaubaCorp directors unavailable -> trying LinkedIn search fallbacks');
     }
 
@@ -321,19 +333,32 @@ async function processCompany(companyName, job) {
     // count — a couple of untitled names off the homepage would suppress it.
     const titledCount = () => leaders.filter((p) => p.designation).length;
     if (titledCount() < 2) {
-      const fromLinkedIn = await leadersFromLinkedInTitles(companyName, log);
-      log(`fallback found ${fromLinkedIn.length} candidate(s) from LinkedIn titles`);
-      merge(fromLinkedIn);
+      try {
+        const fromLinkedIn = await leadersFromLinkedInTitles(companyName, log);
+        log(`fallback found ${fromLinkedIn.length} candidate(s) from LinkedIn titles`);
+        merge(fromLinkedIn);
+      } catch (err) {
+        if (!isSearchUnavailable(err)) throw err;
+        searchUnavailable = err;
+        log(`search temporarily unavailable: ${err.message}`);
+      }
     }
 
     // Fallback 2: mine ordinary web results for "Name, Title" mentions.
     // Gated on titled people for the same reason as fallback 1.
-    if (titledCount() === 0) {
-      merge(await leadersFromWebSnippets(companyName, log));
+    if (titledCount() === 0 && !searchUnavailable) {
+      try {
+        merge(await leadersFromWebSnippets(companyName, log));
+      } catch (err) {
+        if (!isSearchUnavailable(err)) throw err;
+        searchUnavailable = err;
+        log(`search temporarily unavailable: ${err.message}`);
+      }
     }
 
     // Registry names also cover a website that never names its directors.
     if (leaders.length === 0) {
+      if (searchUnavailable) return nullRow('search_unavailable', WEBSITE_SOURCE, searchUnavailable.message);
       log(
         website
           ? 'website found but no directors extracted -> ZaubaCorp fallback'
@@ -368,11 +393,12 @@ async function processCompany(companyName, job) {
       const designation = person.designation || 'Director';
       let url = person.linkedinUrl || null;
 
-      if (!url) {
+      if (!url && !searchUnavailable) {
         log(`finding LinkedIn for ${person.name} (${designation})`);
         try {
           url = await findLinkedInProfile(person.name, companyName, designation, log);
         } catch (err) {
+          if (isSearchUnavailable(err)) searchUnavailable = err;
           log(`LinkedIn lookup failed: ${err.message}`);
         }
       }
@@ -382,16 +408,21 @@ async function processCompany(companyName, job) {
         personName: person.name,
         designation,
         linkedinUrl: url,
-        status: url ? 'ok' : 'no_linkedin',
+        status: url ? 'ok' : searchUnavailable ? 'search_unavailable' : 'no_linkedin',
         source: WEBSITE_SOURCE,
+        ...(searchUnavailable && !url ? { reason: searchUnavailable.message } : {}),
       });
     }
-    if (rows.some((row) => !row.linkedinUrl)) {
+    if (!searchUnavailable && !isCancelled(job) && rows.some((row) => !row.linkedinUrl)) {
       log('director LinkedIn URL missing -> ZaubaCorp director-name fallback');
       return mergeDirectorRows(rows, await lookupRegistry());
     }
     return rows;
   } catch (err) {
+    if (isSearchUnavailable(err)) {
+      log(`search temporarily unavailable: ${err.message}`);
+      return nullRow('search_unavailable', WEBSITE_SOURCE, err.message);
+    }
     log(`unexpected error: ${err.message} -> NULL row`);
     return nullRow('error');
   }
@@ -414,7 +445,9 @@ async function runAgentWithProvider(companies, job) {
   const check = await verifySearchProvider();
   const provider = currentSearchConfig().provider;
   if (check.ok) {
-    job.log(`Search: ${searchProviderLabel()} OK${check.credits == null ? '' : ` — ${check.credits} credits left`}`);
+    const warnings = check.warnings || [];
+    job.log(`Search: ${searchProviderLabel()} ${warnings.length ? 'connected with limited engines' : 'OK'}${check.credits == null ? '' : ` — ${check.credits} credits left`}`);
+    if (warnings.length) job.log(`Search engine availability: ${warnings.join('; ')}`);
   } else if (provider === 'searxng') {
     throw new Error(`SearXNG connection failed: ${check.error}`);
   } else {
