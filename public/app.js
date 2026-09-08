@@ -21,12 +21,27 @@ const statPeople = document.getElementById('statPeople');
 const statLinkedin = document.getElementById('statLinkedin');
 const doneBanner = document.getElementById('doneBanner');
 const errorBanner = document.getElementById('errorBanner');
+const cancelBanner = document.getElementById('cancelBanner');
+const cancelBtn = document.getElementById('cancelBtn');
+const cancelHint = document.getElementById('cancelHint');
 const downloadBtn = document.getElementById('downloadBtn');
 const resultsTableBody = document.querySelector('#resultsTable tbody');
 
 let selectedFile = null;
 let jobId = null;
 let eventSource = null;
+let pollTimer = null;
+let pollController = null;
+let jobFinished = true;
+const providerButtons = [...document.querySelectorAll('[data-provider]')];
+const searxngSettings = document.getElementById('searxngSettings');
+const searxngUrlInput = document.getElementById('searxngUrl');
+const searchStatus = document.getElementById('searchStatus');
+const checkSearchBtn = document.getElementById('checkSearchBtn');
+let searchProvider = 'serper';
+let searchSettingsReady = false;
+let settingsRevision = 0;
+let serperConfigured = false;
 
 // ---------- File selection ----------
 dropZone.addEventListener('click', () => fileInput.click());
@@ -62,7 +77,7 @@ function setFile(f) {
   fileNameEl.textContent = f.name;
   fileSizeEl.textContent = formatSize(f.size);
   fileInfo.classList.remove('hidden');
-  uploadBtn.disabled = false;
+  uploadBtn.disabled = !searchSettingsReady;
 }
 
 clearFileBtn.addEventListener('click', (e) => {
@@ -93,19 +108,31 @@ uploadBtn.addEventListener('click', async () => {
   fd.append('excel', selectedFile);
 
   try {
+    if (searchProvider === 'searxng' && !searxngUrlInput.reportValidity()) {
+      throw new Error('Enter a valid SearXNG instance URL');
+    }
+    fd.append('searchProvider', searchProvider);
+    if (searchProvider === 'searxng') fd.append('searxngUrl', searxngUrlInput.value.trim());
     const res = await fetch('/api/upload', { method: 'POST', body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Upload failed');
 
+    stopJobUpdates();
     jobId = data.jobId;
     statCompanies.textContent = data.companiesFound;
     statusCard.classList.remove('hidden');
     resultsCard.classList.remove('hidden');
     doneBanner.classList.add('hidden');
     errorBanner.classList.add('hidden');
+    cancelBanner.classList.add('hidden');
     downloadBtn.classList.add('hidden');
+    showCancel(true);
     logBox.innerHTML = '';
     resultsTableBody.innerHTML = '';
+    statPeople.textContent = '0';
+    statLinkedin.textContent = '0';
+    statLinkedin.dataset.count = '0';
+    updateProgress({ current: 0, completed: 0, total: data.companiesFound, company: null });
 
     appendLog(`Uploaded "${data.companies.length > 0 ? data.companiesFound : 0}" companies. Agent started...`);
     connectEvents(jobId);
@@ -117,11 +144,51 @@ uploadBtn.addEventListener('click', async () => {
   }
 });
 
-function connectEvents(id) {
-  if (eventSource) eventSource.close();
-  eventSource = new EventSource(`/api/events/${id}`);
+// ---------- Cancel ----------
+function showCancel(visible, { pending = false } = {}) {
+  cancelBtn.classList.toggle('hidden', !visible);
+  cancelHint.classList.toggle('hidden', !visible);
+  cancelBtn.disabled = pending;
+  cancelBtn.textContent = pending ? 'Cancelling...' : 'Cancel Processing';
+}
 
-  eventSource.onmessage = (e) => {
+cancelBtn.addEventListener('click', async () => {
+  if (!jobId || cancelBtn.disabled) return;
+  const id = jobId;
+  showCancel(true, { pending: true });
+  try {
+    const res = await fetch(`/api/cancel/${id}`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not cancel the run');
+    if (id !== jobId) return;
+    appendLog(`[client] ${data.message}`);
+    showToast(data.message, data.ok);
+    // A job that already finished leaves nothing to cancel; its terminal
+    // state event hides the button on its own.
+    if (!data.ok) showCancel(false);
+  } catch (err) {
+    if (id !== jobId) return;
+    showCancel(true);
+    showToast(`Cancel failed: ${err.message}`, false);
+  }
+});
+
+function stopJobUpdates() {
+  jobFinished = true;
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  if (pollController) { pollController.abort(); pollController = null; }
+}
+
+function connectEvents(id) {
+  stopJobUpdates();
+  jobFinished = false;
+  const source = new EventSource(`/api/events/${id}`);
+  eventSource = source;
+
+  source.onmessage = (e) => {
+    if (jobFinished || id !== jobId || eventSource !== source) return;
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
 
@@ -148,32 +215,74 @@ function connectEvents(id) {
     }
   };
 
-  eventSource.onerror = () => {
-    // fall back to polling in case SSE drops
-    setTimeout(() => pollStatus(id), 2000);
+  source.onerror = () => {
+    if (jobFinished || id !== jobId || eventSource !== source) return;
+    // Close SSE so automatic reconnects cannot replay rows while we poll.
+    source.close();
+    eventSource = null;
+    schedulePoll(id);
   };
 }
 
+function schedulePoll(id) {
+  if (jobFinished || id !== jobId || pollTimer !== null) return;
+  pollTimer = setTimeout(() => {
+    pollTimer = null;
+    pollStatus(id);
+  }, 2000);
+}
+
 async function pollStatus(id) {
+  if (jobFinished || id !== jobId || pollController) return;
+  const controller = new AbortController();
+  pollController = controller;
   try {
-    const res = await fetch(`/api/status/${id}`);
+    const res = await fetch(`/api/status/${id}`, { signal: controller.signal });
+    if (jobFinished || id !== jobId) return;
+    if (res.status === 404) {
+      finishJob('Job not found. Start a new upload.', {});
+      return;
+    }
     if (res.ok) {
       const data = await res.json();
-      data.logs.forEach(appendLog);
-      data.rows.forEach(addResultRow);
-      updateProgress(data.progress);
+      if (jobFinished || id !== jobId) return;
+      // Status contains a full snapshot, not new entries to append.
+      logBox.innerHTML = '';
+      resultsTableBody.innerHTML = '';
+      statPeople.textContent = '0';
+      statLinkedin.textContent = '0';
+      statLinkedin.dataset.count = '0';
+      (data.logs || []).forEach(appendLog);
+      (data.rows || []).forEach(addResultRow);
       handleState(data);
     }
   } catch { /* keep trying silently */ }
+  finally {
+    if (pollController === controller) pollController = null;
+    schedulePoll(id);
+  }
 }
 
 function handleState(state) {
+  if (state.progress) updateProgress(state.progress);
+  if (state.meta?.searchProvider) {
+    document.getElementById('jobSearchProvider').textContent = `Search: ${state.meta.searchProvider}`;
+  }
   if (state.status === 'running') {
     progressText.textContent = state.rowsCount > 0
       ? `Processing companies... (${state.rowsCount} result rows so far)`
       : 'Processing companies...';
   }
-  if (state.status === 'done') {
+  if (state.status === 'cancelling') {
+    progressText.textContent = 'Cancelling... finishing the company in progress.';
+    showCancel(true, { pending: true });
+  }
+  if (state.status === 'finalizing') {
+    progressText.textContent = state.cancelled
+      ? 'Cancelled. Preparing a report of the results so far...'
+      : 'All companies fetched. Preparing report...';
+  }
+  if (state.status === 'done' || state.status === 'cancelled') {
     finishJob(null, state);
   } else if (state.status === 'error') {
     finishJob(state.error || 'Unknown server error', state);
@@ -181,31 +290,44 @@ function handleState(state) {
 }
 
 function finishJob(errMsg, state) {
-  if (eventSource) { eventSource.close(); eventSource = null; }
+  stopJobUpdates();
   currentCompanyBox.classList.add('hidden');
-  percentText.textContent = '100%';
-  progressFill.style.width = '100%';
+  showCancel(false);
 
   if (errMsg) {
     errorBanner.textContent = `Processing failed: ${errMsg}`;
     errorBanner.classList.remove('hidden');
     doneBanner.classList.add('hidden');
+    cancelBanner.classList.add('hidden');
     progressText.textContent = 'Failed.';
     return;
   }
-  doneBanner.classList.remove('hidden');
+  const cancelled = state.status === 'cancelled';
+  if (cancelled) {
+    const rows = state.rowsCount || 0;
+    cancelBanner.textContent = `Processing cancelled. ${rows} result row(s) were collected${state.hasOutput ? ' and are ready to download' : ''}.`;
+    cancelBanner.classList.remove('hidden');
+    doneBanner.classList.add('hidden');
+    progressText.textContent = 'Cancelled.';
+  } else {
+    percentText.textContent = '100%';
+    progressFill.style.width = '100%';
+    doneBanner.classList.remove('hidden');
+    cancelBanner.classList.add('hidden');
+    progressText.textContent = 'Complete!';
+  }
   errorBanner.classList.add('hidden');
-  progressText.textContent = 'Complete!';
   if (state.hasOutput) {
     downloadBtn.href = `/api/download/${jobId}`;
+    downloadBtn.textContent = cancelled ? '⬇  Download Partial Report' : '⬇  Download Excel Report';
     downloadBtn.classList.remove('hidden');
   }
 }
 
 function updateProgress(progress) {
-  const { current, total, company } = progress;
+  const { current, total, company, completed = Math.max(0, current - 1) } = progress;
   if (total > 0) {
-    const pct = Math.min(100, Math.round((current / total) * 100));
+    const pct = Math.min(99, Math.round((completed / total) * 100));
     progressFill.style.width = `${pct}%`;
     percentText.textContent = `${pct}%`;
     progressText.textContent = `Company ${current} of ${total}`;
@@ -213,7 +335,7 @@ function updateProgress(progress) {
   if (company && current <= total) {
     currentCompanyBox.classList.remove('hidden');
     currentCompanyName.textContent = `Researching: ${company}`;
-  } else if (current > total) {
+  } else {
     currentCompanyBox.classList.add('hidden');
   }
 }
@@ -226,6 +348,7 @@ const STATUS_LABELS = {
   ok: 'Found',
   ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
+  search_unavailable: 'Search temporarily unavailable',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',
@@ -264,8 +387,21 @@ function addResultRow(row) {
     td.className = 'null';
   }
   tr.appendChild(td);
-  tr.appendChild(makeCell(row.source || DEFAULT_SOURCE));
-  tr.appendChild(makeCell(STATUS_LABELS[row.status] || row.status || ''));
+  const sourceCell = makeCell(row.source || DEFAULT_SOURCE);
+  if (row.source?.startsWith('ZaubaCorp') && row.sourceUrl) {
+    const sourceLink = document.createElement('a');
+    sourceLink.href = row.sourceUrl;
+    sourceLink.target = '_blank';
+    sourceLink.rel = 'noopener noreferrer';
+    sourceLink.textContent = row.source;
+    sourceCell.replaceChildren(sourceLink);
+  }
+  tr.appendChild(sourceCell);
+  const statusCell = makeCell(STATUS_LABELS[row.status] || row.status || '');
+  if (row.reason) statusCell.title = row.reason;
+  tr.appendChild(statusCell);
+  tr.appendChild(makeCell(row.din));
+  tr.appendChild(makeCell(row.appointmentDate));
 
   resultsTableBody.appendChild(tr);
 
@@ -308,7 +444,7 @@ function scrollLog() {
   logBox.scrollTop = logBox.scrollHeight;
 }
 
-// ---------- Serper API key status toast ----------
+// ---------- Search connection status ----------
 let activeToast = null;
 
 function showToast(text, ok) {
@@ -336,40 +472,91 @@ function showToast(text, ok) {
   activeToast.showToast();
 }
 
-let serperChecked = false;
+function setSearchStatus(message, state = '') {
+  searchStatus.textContent = message;
+  searchStatus.dataset.state = state;
+}
 
-async function checkSerperKey() {
-  if (serperChecked) return; // guard against a double invocation
-  serperChecked = true;
+function renderSearchSettings() {
+  providerButtons.forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.provider === searchProvider));
+  });
+  const isSearxng = searchProvider === 'searxng';
+  searxngSettings.classList.toggle('hidden', !isSearxng);
+  searxngUrlInput.required = isSearxng;
+  setSearchStatus(isSearxng
+    ? 'Searches use your SearXNG instance. Test the connection before uploading.'
+    : serperConfigured
+      ? 'Serper key configured. Searches and connection tests use API credits.'
+      : 'No Serper key configured. Searches will use scraped fallback engines.');
+}
+
+function saveSearchSettings() {
+  settingsRevision++;
   try {
-    const res = await fetch('/api/serper-check', {
-      headers: { Accept: 'application/json' },
-    });
+    localStorage.setItem('research-search-settings', JSON.stringify({
+      provider: searchProvider, searxngUrl: searxngUrlInput.value.trim(),
+    }));
+  } catch { /* settings still work when browser storage is disabled */ }
+  renderSearchSettings();
+}
 
-    // A stale server without this route answers with an HTML 404 page, which
-    // blows up res.json() with "Unexpected token '<'". Detect that and say
-    // something useful instead.
-    const ct = res.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      showToast(
-        '⚠️ Serper check endpoint not found — restart the server to pick up /api/serper-check',
-        false
-      );
-      return;
+providerButtons.forEach((button) => button.addEventListener('click', () => {
+  searchProvider = button.dataset.provider;
+  saveSearchSettings();
+}));
+searxngUrlInput.addEventListener('input', saveSearchSettings);
+
+async function loadSearchSettings() {
+  try {
+    const res = await fetch('/api/search-config');
+    if (!res.headers.get('content-type')?.includes('application/json')) {
+      throw new Error('Restart the server to load the search provider settings');
     }
-
     const data = await res.json();
-    if (data.ok) {
-      const credits = data.credits != null ? ` — ${data.credits} credits left` : '';
-      showToast(`✅ Serper API key is working${credits}`, true);
-    } else if (data.configured) {
-      showToast(`❌ Serper API key not working: ${data.error || 'rejected'}`, false);
-    } else {
-      showToast('⚠️ No Serper API key configured — falling back to scraped engines', false);
+    if (!res.ok) throw new Error(data.error || 'Could not load search settings');
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem('research-search-settings')); } catch { /* use server defaults */ }
+    serperConfigured = data.serper.configured;
+    if (!settingsRevision) {
+      searchProvider = ['serper', 'searxng'].includes(saved?.provider) ? saved.provider : data.provider;
+      searxngUrlInput.value = typeof saved?.searxngUrl === 'string' ? saved.searxngUrl : data.searxngUrl;
     }
+    searchSettingsReady = true;
+    checkSearchBtn.disabled = false;
+    uploadBtn.disabled = !selectedFile;
+    renderSearchSettings();
   } catch (err) {
-    showToast(`❌ Could not verify Serper API key: ${err.message}`, false);
+    setSearchStatus(err.message, 'error');
   }
 }
 
-checkSerperKey();
+checkSearchBtn.addEventListener('click', async () => {
+  if (searchProvider === 'searxng' && !searxngUrlInput.reportValidity()) return;
+  const revision = settingsRevision;
+  const provider = searchProvider;
+  checkSearchBtn.disabled = true;
+  setSearchStatus(`Testing ${provider === 'searxng' ? 'SearXNG' : 'Serper'}...`);
+  try {
+    const res = await fetch('/api/search-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, ...(provider === 'searxng' ? { searxngUrl: searxngUrlInput.value.trim() } : {}) }),
+    });
+    const data = await res.json();
+    if (revision !== settingsRevision) return;
+    if (!res.ok || !data.ok) throw new Error(data.error || 'Connection failed');
+    const warnings = data.warnings || [];
+    const message = warnings.length
+      ? `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connected with limited engines (${warnings.join('; ')})`
+      : `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connection is working${data.credits == null ? '' : ` (${data.credits} credits left)`}`;
+    setSearchStatus(message, warnings.length ? 'warning' : 'ok');
+    showToast(message, true);
+  } catch (err) {
+    if (revision === settingsRevision) setSearchStatus(err.message, 'error');
+  } finally {
+    checkSearchBtn.disabled = false;
+  }
+});
+
+loadSearchSettings();

@@ -63,7 +63,20 @@ function nameTokens(name) {
  */
 const MATCH_THRESHOLD = 10;
 
-function validateLinkedInCandidate(url, title, personName, companyName) {
+/** Broad searches can return a namesake; require evidence of the employer. */
+function hasCompanyEvidence(result, companyName) {
+  const brand = brandTokens(companyName);
+  const distinctive = companyTokensOf(brand.join(' '));
+  const tokens = [...new Set(distinctive.length ? distinctive : brand)];
+  if (!tokens.length) return false;
+  const text = `${result.title || ''} ${result.snippet || ''} ${profileSlug(result.url)}`;
+  const words = text.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .split(/[^a-z0-9]+/).filter(Boolean);
+  // Search engines also write brands as joined words, e.g. PlasmaGenBioSciences.
+  return tokens.every((token) => words.includes(token)) || words.join('').includes(tokens.join(''));
+}
+
+function validateLinkedInCandidate(url, title, personName, companyName, snippet = '') {
   if (!isPersonalProfileUrl(url)) return 0;
 
   // "K. Krithivasan" has only one non-initial token; fall back to including
@@ -81,9 +94,10 @@ function validateLinkedInCandidate(url, title, personName, companyName) {
   const slugParts = slug.split(/[-_.\d]+/).filter(Boolean);
 
   const titleLower = String(title || '').toLowerCase();
+  const employerText = `${titleLower} ${String(snippet || '').toLowerCase()}`;
   const companyToks = companyTokensOf(companyName);
   const companyMatch = companyToks.some(
-    (t) => titleLower.includes(t) || slugTight.includes(t)
+    (t) => employerText.includes(t) || slugTight.includes(t)
   );
 
   const meaningful = person.filter((t) => t.length >= 2);
@@ -112,8 +126,8 @@ function validateLinkedInCandidate(url, title, personName, companyName) {
   // real profiles have an abbreviated or custom slug (/in/vinod-n-8a4b21),
   // and rejecting those outright threw away matches a human reads straight
   // off the result: "Vinod Nahar - Chairman - Plasmagen Biosciences".
-  // The full name AND the employer both appearing in the title is at least
-  // as strong as a slug, so it is accepted as an alternative proof.
+  // The profile title must identify the person. Employer evidence may also
+  // come from the snippet, where search engines put the Experience section.
   if (!lastInSlug) {
     if (fullNameInTitle && companyMatch) return MATCH_THRESHOLD + 2;
     return 0;
@@ -168,9 +182,13 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
   const brand = brandTokens(companyName).join(' ') || companyName;
 
   const queries = [
-    // site: first — a general query full of celebrity noise used to
-    // short-circuit the fallback chain and produce a NULL for everyone.
+    // Start with the company + name search a person would type. Exact quotes
+    // can miss profiles whose names include additional words or initials.
+    `${String(companyName).trim()} ${personName}`,
+    `${brand} ${personName} LinkedIn`,
+    // Narrow the search if broad results do not establish both identity and employer.
     `site:linkedin.com/in "${personName}" "${brand}"`,
+    `site:linkedin.com/in ${personName} ${brand}`,
     `site:linkedin.com/in "${personName}" ${brand}`,
     `"${personName}" ${brand} linkedin`,
     `"${personName}" "${brand}" linkedin profile`,
@@ -180,9 +198,8 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
     queries.push(`"${personName}" "${designation}" ${brand} linkedin profile`);
   }
   queries.push(`"${personName}" linkedin.com/in ${brand}`);
-  // Last resort: the person's headline may not mention the employer at all.
-  // Only reached when everything above came back empty, so it costs nothing
-  // in the common case; scoring still has to clear the threshold.
+  // A name-only query can reveal employer evidence in Experience snippets
+  // omitted by company-scoped searches. That evidence is still required.
   queries.push(`site:linkedin.com/in "${personName}"`);
 
   // Stop as soon as a profile is found that already clears the bar. Waiting
@@ -193,19 +210,20 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
     log,
     accept: (r) =>
       isPersonalProfileUrl(r.url) &&
-      validateLinkedInCandidate(r.url, r.title, personName, companyName) >= MATCH_THRESHOLD,
+      hasCompanyEvidence(r, companyName) &&
+      validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) >= MATCH_THRESHOLD,
     minAccepted: 1,
   });
 
-  const profiles = results.filter((r) => isPersonalProfileUrl(r.url));
-  log(`    ${results.length} result(s), ${profiles.length} personal profile(s)`);
+  const profiles = results.filter((r) => isPersonalProfileUrl(r.url) && hasCompanyEvidence(r, companyName));
+  log(`    ${results.length} result(s), ${profiles.length} personal profile(s) with company evidence`);
   if (profiles.length === 0) {
-    log('    no LinkedIn profile in results');
+    log('    no LinkedIn profile with company evidence in results');
     return null;
   }
 
   const scored = profiles
-    .map((r) => ({ ...r, score: validateLinkedInCandidate(r.url, r.title, personName, companyName) }))
+    .map((r) => ({ ...r, score: validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) }))
     .sort((a, b) => b.score - a.score);
 
   const best = scored[0];
@@ -222,8 +240,8 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
     // overrule the surname rule. Without this a non-person that slipped
     // through ("AIG Hospitals") was handed someone else's profile.
     const chosen = profiles.find((p) => p.url === llmPick) || { url: llmPick, title: '' };
-    const sanity = validateLinkedInCandidate(chosen.url, chosen.title, personName, companyName);
-    if (sanity > 0) {
+    const sanity = validateLinkedInCandidate(chosen.url, chosen.title, personName, companyName, chosen.snippet);
+    if (sanity > 0 && hasCompanyEvidence(chosen, companyName)) {
       log(`    LLM picked: ${llmPick}`);
       return llmPick;
     }

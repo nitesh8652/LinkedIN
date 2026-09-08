@@ -25,7 +25,7 @@ require.cache[searchPath] = { id: searchPath, filename: searchPath, loaded: true
   ],
   closeSearchBrowser: async () => {},
   serperStatus: () => ({ configured: true, active: true, credits: 999 }),
-  verifySerperKey: async () => ({ configured: true, ok: true, credits: 999 }),
+  verifySearchProvider: async () => ({ configured: true, ok: true, credits: 999 }),
 }};
 
 require.cache[discoverPath] = { id: discoverPath, filename: discoverPath, loaded: true, exports: {

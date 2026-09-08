@@ -75,6 +75,7 @@ const STATUS_LABELS = {
   ok: 'Found',
   ok_medium: 'Found (medium confidence)',
   no_linkedin: 'No LinkedIn match',
+  search_unavailable: 'Search temporarily unavailable',
   no_directors: 'Website found, no directors named',
   no_website: 'Official website not found',
   error: 'Error during research',
@@ -109,6 +110,9 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
     { header: 'LinkedIn URL', key: 'linkedinUrl', width: 46 },
     { header: 'Source', key: 'source', width: 18 },
     { header: 'Status', key: 'status', width: 34 },
+    { header: 'DIN / DPIN', key: 'din', width: 16 },
+    { header: 'Appointment Date', key: 'appointmentDate', width: 22 },
+    { header: 'Source URL', key: 'sourceUrl', width: 48 },
   ];
 
   for (const r of rows) {
@@ -119,6 +123,9 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
       linkedinUrl: r.linkedinUrl || NULL_VALUE,
       source: r.source || DEFAULT_SOURCE,
       status: statusLabel(r.status),
+      din: r.din || NULL_VALUE,
+      appointmentDate: r.appointmentDate || NULL_VALUE,
+      sourceUrl: r.sourceUrl || NULL_VALUE,
     });
   }
 
@@ -149,7 +156,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
   }
 
   ws.views = [{ state: 'frozen', ySplit: 1 }];
-  ws.autoFilter = { from: 'A1', to: 'F1' };
+  ws.autoFilter = { from: 'A1', to: 'I1' };
 
   // Summary sheet
   const sumWs = workbook.addWorksheet('Summary');
@@ -168,6 +175,14 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
     { metric: 'LLM Layer', value: meta.llmEnabled ? 'Enabled' : 'Heuristic mode (no API key)' },
     { metric: 'Search Provider', value: meta.searchProvider || 'scraped engines' },
   ]);
+  // A cancelled run produces a real report of partial results; say so, so the
+  // missing companies read as "stopped early", not "nothing found".
+  if (meta.cancelled) {
+    sumWs.addRow({
+      metric: 'Run Status',
+      value: `Cancelled by user after ${meta.companiesProcessed ?? totalCompanies} of ${meta.totalCompanies ?? totalCompanies} companies`,
+    }).font = { bold: true };
+  }
 
   // Where the NULLs actually come from — the whole point of keeping status.
   const byStatus = new Map();

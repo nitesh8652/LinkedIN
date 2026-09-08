@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><title>ACME FOODS PRIVATE LIMITED | ZaubaCorp</title></head>
+<body>
+  <h1>ACME FOODS PRIVATE LIMITED</h1>
+  <p>Directors of ACME FOODS PRIVATE LIMITED are STALE PERSON.</p>
+  <h2>Other contacts</h2>
+  <table><tr><th>Name</th><th>Role</th></tr><tr><td>Unrelated Person</td><td>Director</td></tr></table>
+  <a href="#director-information">Directors</a>
+  <section id="director-information">
+    <h2><button aria-expanded="false" aria-controls="director-panel" onclick="openDirectors(this)">Directors</button></h2>
+    <div id="director-panel" hidden></div>
+  </section>
+  <template id="director-rows">
+    <h3>Current Directors &amp; Key Managerial Personnel</h3>
+    <table>
+      <thead><tr><th>DIN/DPIN</th><th>Name of Director</th><th>Designation</th><th>Date of Appointment</th><th>Date of Cessation</th></tr></thead>
+      <tbody>
+        <tr><td><a href="/director/ASHA-RAO/00001234">00001234</a></td><td><a href="/director/ASHA-RAO/00001234">ASHA RAO</a></td><td>Managing Director</td><td>20/09/2006</td><td>-</td></tr>
+        <tr><td>00005678</td><td>BIMAL SHAH</td><td>Director</td><td>17/03/2015</td><td>N/A</td></tr>
+        <tr><td>00009876</td><td>VIKRAM DESAI</td><td>Director</td><td>17/03/2015</td><td>01/01/2020</td></tr>
+      </tbody>
+    </table>
+    <h3>Past Directors</h3>
+    <table><tr><th>DIN</th><th>Name</th><th>Designation</th></tr><tr><td>00001111</td><td>Priya Nair</td><td>Director</td></tr></table>
+    <h3>Other Directorships</h3>
+    <table><tr><th>CIN</th><th>Company Name</th><th>Designation</th></tr><tr><td>U12345AA2000PTC123456</td><td>Another Foods</td><td>Director</td></tr></table>
+  </template>
+  <script>
+    function openDirectors(button) {
+      button.setAttribute('aria-expanded', 'true');
+      const panel = document.getElementById('director-panel');
+      panel.hidden = false;
+      setTimeout(() => { panel.innerHTML = document.getElementById('director-rows').innerHTML; }, 150);
+    }
+  </script>
+</body>
+</html>
