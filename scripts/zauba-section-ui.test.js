@@ -6,7 +6,9 @@ const { chromium } = require('playwright');
 const { withSearchConfig } = require('../src/search-config');
 const { findDirectorsOnZaubaCorp, closeZaubaBrowser, openDirectorInformation } = require('../src/zaubacorp');
 
-test('SearXNG company result opens the Directors fragment, expands its panel and waits for director rows', async (t) => {
+for (const provider of ['searxng', 'serpapi', 'hybrid']) {
+test(`${provider} company result opens the Directors fragment, expands its panel and waits for director rows`, async (t) => {
+  process.env.SERPAPI_API_KEY = 'zauba-ui-test-key';
   const fixture = await fs.readFile(path.join(__dirname, 'fixtures/zauba-directors.html'), 'utf8');
   const companyUrl = 'https://www.zaubacorp.com/ACME-FOODS-PRIVATE-LIMITED-U12345AA2000PTC123456';
   const browser = await chromium.launch({ headless: true });
@@ -38,17 +40,21 @@ test('SearXNG company result opens the Directors fragment, expands its panel and
   t.mock.method(globalThis, 'fetch', async (input) => {
     const url = new URL(input);
     searchOrigins.push(url.origin);
+    if (url.hostname === 'serpapi.com') return new Response(JSON.stringify({ organic_results: [{
+      link: companyUrl, title: 'ACME FOODS PRIVATE LIMITED | ZaubaCorp', snippet: 'Company information',
+    }] }));
     return new Response(JSON.stringify({ results: [{
       url: companyUrl, title: 'ACME FOODS PRIVATE LIMITED | ZaubaCorp', content: 'Company information',
     }] }));
   });
   const logs = [];
-  const result = await withSearchConfig({ provider: 'searxng', searxngUrl: 'http://localhost:8080' }, () =>
+  const result = await withSearchConfig({ provider, searxngUrl: 'http://localhost:8080' }, () =>
     findDirectorsOnZaubaCorp('Acme Foods Private Limited', (line) => logs.push(line)));
   assert.equal(result.ok, true, result.reason);
   assert.equal(result.pageUrl, `${companyUrl}#director-information`);
   assert.deepEqual(navigations, [`${companyUrl}#director-information`]);
-  assert.deepEqual(searchOrigins, ['http://localhost:8080'], 'navigate after a matching SearXNG result; never call Serper');
+  assert.deepEqual(searchOrigins.sort(), (provider === 'hybrid' ? ['https://serpapi.com', 'http://localhost:8080']
+    : [provider === 'serpapi' ? 'https://serpapi.com' : 'http://localhost:8080']).sort(), 'navigate after a matching result; only use the selected provider');
   assert.deepEqual(result.directors.map((person) => person.name), ['ASHA RAO', 'BIMAL SHAH']);
   assert.equal(result.directors[0].din, '00001234');
   assert.equal(result.directors[0].appointmentDate, '20/09/2006');
@@ -62,3 +68,4 @@ test('SearXNG company result opens the Directors fragment, expands its panel and
   await openDirectorInformation(companyPage, (line) => headingLogs.push(line));
   assert.ok(headingLogs.every((line) => !line.includes('timeout')), 'heading anchors must recognize the following table');
 });
+}

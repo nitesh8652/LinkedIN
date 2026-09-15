@@ -18,6 +18,8 @@
 require('./env');
 const { chromium } = require('playwright');
 const { currentSearchConfig, noteSearchProvider } = require('./search-config');
+const { runSerpapi, serpapiStatus } = require('./serpapi');
+const { createOwnSearch } = require('./own-search');
 
 const SEARCH_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -129,7 +131,15 @@ function isRelevant(result, { site, phrases, tokens }, { trusted = false, minTok
   const hay = `${url} ${String(result.title || '')} ${String(result.snippet || '')}`.toLowerCase();
   const tight = hay.replace(/[^a-z0-9]/g, '');
 
-  if (site && !url.includes(site.toLowerCase().replace(/^www\./, ''))) return false;
+  if (site) {
+    try {
+      const wanted = new URL(`https://${site.replace(/^https?:\/\//i, '').replace(/^www\./i, '')}`);
+      const actual = new URL(url);
+      if (actual.hostname !== wanted.hostname && !actual.hostname.endsWith(`.${wanted.hostname}`)) return false;
+      const path = wanted.pathname.replace(/\/$/, '');
+      if (path && actual.pathname !== path && !actual.pathname.startsWith(`${path}/`)) return false;
+    } catch { return false; }
+  }
 
   // A real search API already did the matching, and its snippets are short
   // enough that a genuinely correct hit often fails a literal phrase test.
@@ -388,7 +398,7 @@ function unavailableEngines(blocked, retryWithRemainingEngines = false) {
 }
 
 /** Query only web engines; general categories also include Wikipedia, etc. */
-async function runSearxng(query, { engines = '', log = null } = {}) {
+async function runSearxng(query, { engines = '', log = null, signal, onWarning } = {}) {
   const url = new URL(currentSearchConfig().searxngUrl);
   const requested = [...new Set(String(engines || process.env.SEARXNG_ENGINES || 'google,bing')
     .split(',').map((engine) => engine.trim()).filter(Boolean))];
@@ -408,7 +418,7 @@ async function runSearxng(query, { engines = '', log = null } = {}) {
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
     const res = await fetch(url, {
-      signal: controller.signal,
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       headers: { Accept: 'application/json', 'User-Agent': SEARCH_UA },
     });
     if (res.status === 403) {
@@ -444,11 +454,13 @@ async function runSearxng(query, { engines = '', log = null } = {}) {
       warnSearxngOnce(engine, reason, log);
     }
     const unavailable = requested.filter((engine) => state.has(engine));
+    for (const engine of unavailable) onWarning?.(`${engine}: ${state.get(engine).reason}`);
     if (!results.length && unavailable.length) {
       throw unavailableEngines(unavailable.map((engine) => [engine, state.get(engine)]), unavailable.length < requested.length);
     }
     return results;
   } catch (err) {
+    if (signal?.aborted) throw new DOMException('Search cancelled', 'AbortError');
     if (err.name === 'AbortError') throw new Error('SearXNG timed out after 20 seconds');
     if (err.message === 'fetch failed') throw new Error('Cannot reach SearXNG. Check the instance URL and that it is running');
     throw err;
@@ -457,8 +469,101 @@ async function runSearxng(query, { engines = '', log = null } = {}) {
   }
 }
 
+const hybridWarnings = new WeakMap();
+
+/** Race usable results, not HTTP responses: an empty/irrelevant fast engine
+ * must not suppress a slower engine's verified LinkedIn profile. */
+function runHybrid(query, { accept = null, searxngEngines = '', log = null } = {}) {
+  const config = currentSearchConfig();
+  const constraints = queryConstraints(query);
+  const controllers = [new AbortController(), new AbortController()];
+  const labels = ['SerpApi', 'SearXNG'];
+  const warnings = [];
+  const collected = [];
+  const sources = [];
+  let pending = 2;
+  let successes = 0;
+  let finished = false;
+  if (!hybridWarnings.has(config)) hybridWarnings.set(config, new Set());
+  const warned = hybridWarnings.get(config);
+
+  return new Promise((resolve, reject) => {
+    const complete = () => {
+      if (finished) return;
+      finished = true;
+      controllers.forEach((controller) => controller.abort());
+      if (!successes) {
+        reject(searchUnavailable(`Both search providers are unavailable. ${warnings.join('; ')}`));
+      } else {
+        const results = toResults(collected.map((r) => ({ href: r.url, title: r.title, snippet: r.snippet })));
+        resolve({ results, warnings, source: sources.join(' + ') });
+      }
+    };
+    const tasks = [
+      () => runSerpapi(query, { signal: controllers[0].signal }).then(toResults),
+      () => runSearxng(query, { engines: searxngEngines, log, signal: controllers[1].signal }),
+    ];
+    tasks.forEach((task, index) => {
+      Promise.resolve().then(task).then((raw) => {
+        if (finished) return;
+        successes++;
+        const results = raw.filter((r) => isRelevant(r, constraints, { trusted: true }));
+        sources.push(labels[index]);
+        collected.push(...results);
+        if (log) log(`      [hybrid/${labels[index]}] ${results.length} relevant result(s)`);
+        pending--;
+        if (results.some(accept || (() => true)) || !pending) complete();
+      }, (err) => {
+        if (finished) return;
+        const warning = `${labels[index]}: ${err.message}`;
+        warnings.push(warning);
+        if (log && !warned.has(warning)) {
+          warned.add(warning);
+          log(`      [hybrid] ${warning}; continuing with the other provider`);
+        }
+        pending--;
+        if (!pending) complete();
+      });
+    });
+  });
+}
+
+const ownSearch = createOwnSearch({ runSearxng, queryConstraints, isRelevant });
+
 async function verifySearchProvider() {
+  if (currentSearchConfig().provider === 'linkedin') {
+    const status = await require('./linkedin-direct').getLinkedInStatus();
+    return { configured: status.configured, ok: status.connected,
+      ...(status.connected ? {} : { error: status.message || 'Connect LinkedIn and sign in before starting.' }) };
+  }
+  if (currentSearchConfig().provider === 'own') {
+    try {
+      const check = await ownSearch.search('LinkedIn official website');
+      if (!check.results.length) throw new Error('Own Search returned no results for the connection check');
+      return { configured: true, ok: true, warnings: check.warnings, respondingProvider: check.sources.join(' + ') };
+    } catch (err) {
+      return { configured: true, ok: false, error: err.message };
+    }
+  }
+  if (currentSearchConfig().provider === 'hybrid') {
+    try {
+      const check = await runHybrid('linkedin');
+      if (!check.results.length) throw new Error('Neither provider returned results for the connection check');
+      return { configured: true, ok: true, warnings: check.warnings, respondingProvider: check.source };
+    } catch (err) {
+      return { configured: true, ok: false, error: err.message };
+    }
+  }
   if (currentSearchConfig().provider === 'serper') return verifySerperKey();
+  if (currentSearchConfig().provider === 'serpapi') {
+    try {
+      const results = toResults(await runSerpapi('linkedin'));
+      if (!results.length) throw new Error('SerpApi returned no search results for the connection check');
+      return { ...serpapiStatus(), ok: true };
+    } catch (err) {
+      return { ...serpapiStatus(), ok: false, error: err.message };
+    }
+  }
   try {
     const results = await runSearxng('linkedin');
     if (!results.length) throw new Error('SearXNG returned no search results for the connection check; check that its search engines are working');
@@ -592,11 +697,24 @@ const queryCache = new Map();
 const QUERY_CACHE_MAX = 500;
 const QUERY_CACHE_TTL_MS = 10 * 60 * 1000;
 
-async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } = {}) {
+async function searchWeb(query, { limit = 15, log = null, searxngEngines = '', accept = null } = {}) {
   const config = currentSearchConfig();
-  const cacheKey = JSON.stringify([config.provider, config.provider === 'searxng' ? config.searxngUrl : '',
-    config.provider === 'searxng' ? searxngEngines : '', query.toLowerCase().trim()]);
-  if (queryCache.get(cacheKey)?.expiresAt > Date.now()) {
+  // Direct mode uses structured name/company lookups. Never let a generic
+  // query fall through to a paid API or a throttled scraped search engine.
+  if (config.provider === 'linkedin') {
+    throw Object.assign(new Error('LinkedIn Direct uses people search by director name and company.'), { code: 'SEARCH_UNAVAILABLE' });
+  }
+  if (config.provider === 'own') {
+    const response = await ownSearch.search(query, { limit, log, searxngEngines, accept });
+    noteSearchProvider('own');
+    if (log && response.cached) log(`      [own/cache] ${response.results.length} result(s)`);
+    return response.results;
+  }
+  const usesSearxng = ['searxng', 'hybrid'].includes(config.provider);
+  const cacheKey = JSON.stringify([config.provider, usesSearxng ? config.searxngUrl : '',
+    usesSearxng ? searxngEngines : '', query.toLowerCase().trim()]);
+  if (queryCache.get(cacheKey)?.expiresAt > Date.now() &&
+      (!accept || queryCache.get(cacheKey).results.some(accept))) {
     const { results, source } = queryCache.get(cacheKey);
     noteSearchProvider(source);
     if (log) log(`      [cache: ${source}] ${results.length} result(s)`);
@@ -621,6 +739,20 @@ async function searchWeb(query, { limit = 15, log = null, searxngEngines = '' } 
 
   // A successful API response is final, including a valid empty result set.
   // Provider failures may use scraped engines, but never the other paid API.
+  // SerpApi failures surface explicitly so quota/network failures cannot be
+  // mistaken for missing directors or spend credits on another paid service.
+  if (config.provider === 'hybrid') {
+    const { results, source } = await runHybrid(query, { accept, searxngEngines, log });
+    noteSearchProvider(source);
+    return remember(results, source);
+  }
+  if (config.provider === 'serpapi') {
+    const results = toResults(await runSerpapi(query));
+    const relevant = results.filter((r) => isRelevant(r, constraints, { trusted: true }));
+    if (log) log(`      [serpapi] ${results.length} raw / ${relevant.length} relevant`);
+    noteSearchProvider('serpapi');
+    return remember(relevant);
+  }
   if (config.provider === 'searxng') {
     const source = searxngEngines ? `searxng/${searxngEngines}` : 'searxng';
     try {
@@ -707,7 +839,7 @@ async function searchWithFallbackQueries(buildQueries, opts = {}) {
   for (const [index, q] of queries.entries()) {
     let results;
     try {
-      results = await searchWeb(q, { log, searxngEngines });
+      results = await searchWeb(q, { log, searxngEngines, accept });
     } catch (err) {
       if (err.code !== 'SEARCH_UNAVAILABLE') throw err;
       unavailable = err;
@@ -733,7 +865,8 @@ async function searchWithFallbackQueries(buildQueries, opts = {}) {
 
     // The pacing exists to keep scraped engines from throttling us. An API
     // key has no such problem, and the delay dominates the runtime.
-    if (index < queries.length - 1 && (currentSearchConfig().provider !== 'serper' || !serperEnabled())) {
+    const provider = currentSearchConfig().provider;
+    if (index < queries.length - 1 && !['serpapi', 'hybrid'].includes(provider) && (provider !== 'serper' || !serperEnabled())) {
       await sleep(600 + Math.random() * 900);
     }
   }
@@ -751,7 +884,9 @@ module.exports = {
   normalizeUrl,
   serperEnabled,
   serperStatus,
+  serpapiStatus,
   verifySerperKey,
   verifySearchProvider,
   runSearxng,
+  ownSearch,
 };

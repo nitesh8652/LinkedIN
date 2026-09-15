@@ -110,3 +110,11 @@ test('website with no extracted director names still uses registry names', async
   assert.equal(rows[0].status, 'linkedin_unverified');
   assert.equal(calls.filter((call) => call === 'registry').length, 1);
 });
+
+test('every registry director gets a LinkedIn lookup even when there are more than eight', async () => {
+  const names = ['Asha Rao', 'Bimal Shah', 'Vinay Rathi', 'Priya Nair', 'Sunil Mehta', 'Rama Rao',
+    'Anil Kumar', 'Vinod Nahar', 'Jitendra Shah', 'Dilip Shah', 'Ramesh Patel', 'Arnav Jain'];
+  const rows = await run({ directors: names.map(person) });
+  assert.deepEqual(rows.map((row) => row.personName), names);
+  assert.equal(calls.filter((call) => call.startsWith('registry LinkedIn:')).length, names.length);
+});

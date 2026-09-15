@@ -68,9 +68,9 @@ header p { color: var(--muted); font-size: 14px; }
 /* ---------- Drop zone ---------- */
 .search-settings { margin-bottom: 22px; }
 .field-label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
-.provider-switch { display: flex; gap: 10px; margin-bottom: 14px; }
+.provider-switch { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 10px; margin-bottom: 14px; }
 .provider-button {
-  flex: 1; padding: 12px; border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px; border: 1px solid var(--border); border-radius: 10px;
   background: #f8fafc; color: var(--text); text-align: left; cursor: pointer;
   font: inherit; font-size: 14px; font-weight: 600;
 }
@@ -81,9 +81,13 @@ header p { color: var(--muted); font-size: 14px; }
 .provider-status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .check-search { border: 1px solid var(--border); background: #fff; color: var(--primary); border-radius: 8px; padding: 8px 12px; cursor: pointer; }
 .check-search:disabled { opacity: .6; cursor: wait; }
+.linkedin-settings { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: #f8fafc; }
+.linkedin-settings .hint:first-child { margin-top: 0; }
+.linkedin-settings .check-search { margin-top: 12px; }
 #searchStatus[data-state="error"] { color: var(--danger); }
 #searchStatus[data-state="ok"] { color: var(--success); }
 #jobSearchProvider { margin-bottom: 14px; }
+.status-detail { display: block; max-width: 320px; margin-top: 5px; white-space: normal; overflow-wrap: anywhere; color: var(--text-light, #64748b); }
 
 .drop-zone {
   border: 2px dashed #c3cede;

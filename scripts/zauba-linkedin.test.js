@@ -39,7 +39,7 @@ test('registry middle names can resolve to a shorter LinkedIn name with employer
   assert.equal(verdict.url, profile.url);
   assert.equal(verdict.confidence, 'medium');
   assert.equal(queries.length, 2, 'stop as soon as a verified match is found');
-  assert.equal(queries[0], 'Acme Foods Private Limited Rajesh Kumar Sharma');
+  assert.equal(queries[0], 'Rajesh Kumar Sharma Acme Foods Private Limited');
 });
 
 test('company plus registry name finds a personal URL among ordinary Google results through SearXNG', async (t) => {
@@ -52,7 +52,7 @@ test('company plus registry name finds a personal URL among ordinary Google resu
   ]);
   const verdict = await withSearchConfig(config, () =>
     verifyDirectorOnLinkedIn('Arnav Jain', 'Plasmagen Biosciences', 'Director'));
-  assert.deepEqual(queries, ['Plasmagen Biosciences Arnav Jain']);
+  assert.deepEqual(queries, ['Arnav Jain Plasmagen Biosciences']);
   assert.equal(verdict.url, expectedUrl);
   assert.equal(verdict.confidence, 'high');
 });

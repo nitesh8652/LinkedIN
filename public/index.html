@@ -23,8 +23,17 @@
       <div class="search-settings">
         <p id="providerLabel" class="field-label">Search provider</p>
         <div class="provider-switch" role="group" aria-labelledby="providerLabel">
-          <button type="button" class="provider-button" data-provider="serper" aria-pressed="true">Serper <span>Uses API credits</span></button>
+          <button type="button" class="provider-button" data-provider="linkedin" aria-pressed="true">LinkedIn Direct <span>Search LinkedIn · No paid credits</span></button>
+          <button type="button" class="provider-button" data-provider="own" aria-pressed="false">Own Search <span>SearXNG + direct engines · No paid key</span></button>
+          <button type="button" class="provider-button" data-provider="serper" aria-pressed="false">Serper <span>Uses API credits</span></button>
+          <button type="button" class="provider-button" data-provider="serpapi" aria-pressed="false">SerpApi <span>Google + LinkedIn + ZaubaCorp</span></button>
+          <button type="button" class="provider-button" data-provider="hybrid" aria-pressed="false">SerpApi + SearXNG <span>Search both in parallel</span></button>
           <button type="button" class="provider-button" data-provider="searxng" aria-pressed="false">SearXNG <span>No Serper credits</span></button>
+        </div>
+        <div id="linkedinSettings" class="linkedin-settings">
+          <p class="hint">Search LinkedIn using the director's name and company. If no director names are available, search the company's leadership directly.</p>
+          <p class="hint">Connect LinkedIn to open a separate browser on this computer. Sign in there, then click Test connection before uploading. No paid search credits are used.</p>
+          <button type="button" id="connectLinkedinBtn" class="check-search" disabled>Connect LinkedIn</button>
         </div>
         <div id="searxngSettings" class="hidden">
           <label for="searxngUrl" class="field-label">SearXNG instance URL</label>
@@ -51,7 +60,7 @@
           <line x1="12" y1="3" x2="12" y2="15"/>
         </svg>
         <p><strong>Drag &amp; drop</strong> your .xlsx file here, or click to browse</p>
-        <p class="hint">The file should contain a column with company names (e.g. "Company Name").</p>
+        <p class="hint">Include a Company Name column. Add optional Director Name and Designation columns to search known directors; repeat the company for each director. You can also upload a previous report with a Person Name column.</p>
       </div>
       <input type="file" id="fileInput" accept=".xlsx,.xlsm" hidden />
 

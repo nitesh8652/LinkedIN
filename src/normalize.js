@@ -35,12 +35,18 @@ function basicClean(name) {
     .trim();
 }
 
+/** A trailing RXIL label belongs to the input list, not the registered name.
+ * Keep the original input in reports and in the first person search. */
+function companySearchName(rawName) {
+  return displayName(rawName).replace(/\s+(?:[-|]\s*)?RXIL$/i, '').trim();
+}
+
 /**
  * Fully normalized key for dedupe/matching:
  * lowercase, no punctuation, no legal suffixes, no stopwords.
  */
 function normalizeCompanyName(rawName) {
-  let name = basicClean(rawName);
+  let name = basicClean(companySearchName(rawName));
   if (!name) return '';
 
   // Repeatedly strip legal suffixes from the end
@@ -79,7 +85,7 @@ const ENTITY_SUFFIXES = [
  * "Tata Consultancy Services Ltd" -> ['tata','consultancy','services']
  */
 function brandTokens(rawName) {
-  let name = basicClean(rawName);
+  let name = basicClean(companySearchName(rawName));
   if (!name) return [];
 
   let changed = true;
@@ -121,4 +127,4 @@ function sameCompany(a, b) {
   return hits / small.size >= 0.8 && hits >= 1;
 }
 
-module.exports = { normalizeCompanyName, brandTokens, displayName, sameCompany, basicClean };
+module.exports = { normalizeCompanyName, brandTokens, displayName, sameCompany, basicClean, companySearchName };

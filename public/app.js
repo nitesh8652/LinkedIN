@@ -38,10 +38,19 @@ const searxngSettings = document.getElementById('searxngSettings');
 const searxngUrlInput = document.getElementById('searxngUrl');
 const searchStatus = document.getElementById('searchStatus');
 const checkSearchBtn = document.getElementById('checkSearchBtn');
-let searchProvider = 'serper';
+const linkedinSettings = document.getElementById('linkedinSettings');
+const connectLinkedinBtn = document.getElementById('connectLinkedinBtn');
+let searchProvider = 'linkedin';
 let searchSettingsReady = false;
 let settingsRevision = 0;
 let serperConfigured = false;
+let serpapiConfigured = false;
+let linkedinConnection = null;
+let linkedinConnecting = false;
+let searchChecking = false;
+let uploading = false;
+const providerNames = { linkedin: 'LinkedIn Direct', own: 'Own Search', serper: 'Serper', serpapi: 'SerpApi', searxng: 'SearXNG', hybrid: 'SerpApi + SearXNG' };
+const usesSearxng = () => ['own', 'searxng', 'hybrid'].includes(searchProvider);
 
 // ---------- File selection ----------
 dropZone.addEventListener('click', () => fileInput.click());
@@ -77,7 +86,7 @@ function setFile(f) {
   fileNameEl.textContent = f.name;
   fileSizeEl.textContent = formatSize(f.size);
   fileInfo.classList.remove('hidden');
-  uploadBtn.disabled = !searchSettingsReady;
+  updateSearchControls();
 }
 
 clearFileBtn.addEventListener('click', (e) => {
@@ -101,18 +110,19 @@ function formatSize(bytes) {
 // ---------- Upload & process ----------
 uploadBtn.addEventListener('click', async () => {
   if (!selectedFile || uploadBtn.disabled) return;
-  uploadBtn.disabled = true;
+  uploading = true;
+  updateSearchControls();
   uploadBtn.textContent = 'Uploading...';
 
   const fd = new FormData();
   fd.append('excel', selectedFile);
 
   try {
-    if (searchProvider === 'searxng' && !searxngUrlInput.reportValidity()) {
+    if (usesSearxng() && !searxngUrlInput.reportValidity()) {
       throw new Error('Enter a valid SearXNG instance URL');
     }
     fd.append('searchProvider', searchProvider);
-    if (searchProvider === 'searxng') fd.append('searxngUrl', searxngUrlInput.value.trim());
+    if (usesSearxng()) fd.append('searxngUrl', searxngUrlInput.value.trim());
     const res = await fetch('/api/upload', { method: 'POST', body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Upload failed');
@@ -139,7 +149,8 @@ uploadBtn.addEventListener('click', async () => {
   } catch (err) {
     alert(`Error: ${err.message}`);
   } finally {
-    uploadBtn.disabled = false;
+    uploading = false;
+    updateSearchControls();
     uploadBtn.textContent = 'Upload & Start Processing';
   }
 });
@@ -179,11 +190,13 @@ function stopJobUpdates() {
   clearTimeout(pollTimer);
   pollTimer = null;
   if (pollController) { pollController.abort(); pollController = null; }
+  updateSearchControls();
 }
 
 function connectEvents(id) {
   stopJobUpdates();
   jobFinished = false;
+  updateSearchControls();
   const source = new EventSource(`/api/events/${id}`);
   eventSource = source;
 
@@ -398,7 +411,13 @@ function addResultRow(row) {
   }
   tr.appendChild(sourceCell);
   const statusCell = makeCell(STATUS_LABELS[row.status] || row.status || '');
-  if (row.reason) statusCell.title = row.reason;
+  if (row.reason) {
+    statusCell.title = row.reason;
+    const detail = document.createElement('small');
+    detail.className = 'status-detail';
+    detail.textContent = row.reason;
+    statusCell.appendChild(detail);
+  }
   tr.appendChild(statusCell);
   tr.appendChild(makeCell(row.din));
   tr.appendChild(makeCell(row.appointmentDate));
@@ -477,15 +496,43 @@ function setSearchStatus(message, state = '') {
   searchStatus.dataset.state = state;
 }
 
+function updateSearchControls() {
+  const isLinkedin = searchProvider === 'linkedin';
+  checkSearchBtn.disabled = !searchSettingsReady || searchChecking || linkedinConnecting || (isLinkedin && (!jobFinished || uploading));
+  connectLinkedinBtn.disabled = !searchSettingsReady || linkedinConnecting || searchChecking || !jobFinished || uploading;
+  uploadBtn.disabled = !selectedFile || !searchSettingsReady || uploading || !jobFinished ||
+    (isLinkedin && (!linkedinConnection?.connected || linkedinConnecting || searchChecking));
+}
+
 function renderSearchSettings() {
   providerButtons.forEach((button) => {
     button.setAttribute('aria-pressed', String(button.dataset.provider === searchProvider));
   });
   const isSearxng = searchProvider === 'searxng';
-  searxngSettings.classList.toggle('hidden', !isSearxng);
-  searxngUrlInput.required = isSearxng;
+  linkedinSettings.classList.toggle('hidden', searchProvider !== 'linkedin');
+  searxngSettings.classList.toggle('hidden', !usesSearxng());
+  searxngUrlInput.required = usesSearxng();
+  updateSearchControls();
+  if (searchProvider === 'linkedin') {
+    setSearchStatus(linkedinConnection?.message || 'Connect LinkedIn and sign in, then test the connection. Searches run directly on LinkedIn with no paid credits.',
+      linkedinConnection?.connected ? 'ok' : '');
+    return;
+  }
+  if (searchProvider === 'own') {
+    setSearchStatus('Your search API combines SearXNG with direct web searches. No paid search key needed. LinkedIn matches require the same person and company.');
+    return;
+  }
+  if (searchProvider === 'hybrid') {
+    setSearchStatus('Searches both providers in parallel and uses the first relevant results. If one fails, the other continues. Uses SerpApi credits.' +
+      (serpapiConfigured ? '' : ' SerpApi key missing; only SearXNG can respond.'));
+    return;
+  }
   setSearchStatus(isSearxng
     ? 'Searches use your SearXNG instance. Test the connection before uploading.'
+    : searchProvider === 'serpapi'
+      ? serpapiConfigured
+        ? 'SerpApi key configured. Uses Google to find directors and LinkedIn profiles, with ZaubaCorp as a fallback. Searches and connection tests use API credits.'
+        : 'No SerpApi key configured. Set SERPAPI_API_KEY in .env and restart the server.'
     : serperConfigured
       ? 'Serper key configured. Searches and connection tests use API credits.'
       : 'No Serper key configured. Searches will use scraped fallback engines.');
@@ -504,8 +551,43 @@ function saveSearchSettings() {
 providerButtons.forEach((button) => button.addEventListener('click', () => {
   searchProvider = button.dataset.provider;
   saveSearchSettings();
+  if (searchProvider === 'linkedin' && jobFinished && !linkedinConnecting && !searchChecking) refreshLinkedInStatus();
 }));
 searxngUrlInput.addEventListener('input', saveSearchSettings);
+
+async function refreshLinkedInStatus() {
+  try {
+    const res = await fetch('/api/linkedin/status');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not read the LinkedIn connection');
+    linkedinConnection = data;
+  } catch (err) {
+    linkedinConnection = { connected: false, message: err.message };
+  }
+  if (searchProvider === 'linkedin') renderSearchSettings();
+}
+
+connectLinkedinBtn.addEventListener('click', async () => {
+  if (connectLinkedinBtn.disabled) return;
+  linkedinConnecting = true;
+  updateSearchControls();
+  connectLinkedinBtn.textContent = 'Opening LinkedIn...';
+  setSearchStatus('Opening LinkedIn on this computer. Sign in in the browser window.');
+  try {
+    const res = await fetch('/api/linkedin/connect', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not open LinkedIn');
+    linkedinConnection = data;
+    if (searchProvider === 'linkedin') renderSearchSettings();
+  } catch (err) {
+    linkedinConnection = { connected: false, message: err.message };
+    if (searchProvider === 'linkedin') setSearchStatus(err.message, 'error');
+  } finally {
+    linkedinConnecting = false;
+    connectLinkedinBtn.textContent = 'Connect LinkedIn';
+    updateSearchControls();
+  }
+});
 
 async function loadSearchSettings() {
   try {
@@ -518,44 +600,53 @@ async function loadSearchSettings() {
     let saved = null;
     try { saved = JSON.parse(localStorage.getItem('research-search-settings')); } catch { /* use server defaults */ }
     serperConfigured = data.serper.configured;
+    serpapiConfigured = Boolean(data.serpapi?.configured);
     if (!settingsRevision) {
-      searchProvider = ['serper', 'searxng'].includes(saved?.provider) ? saved.provider : data.provider;
-      searxngUrlInput.value = typeof saved?.searxngUrl === 'string' ? saved.searxngUrl : data.searxngUrl;
+      searchProvider = Object.hasOwn(providerNames, saved?.provider) ? saved.provider : 'linkedin';
+      searxngUrlInput.value = typeof saved?.searxngUrl === 'string' ? saved.searxngUrl : data.searxngUrl || 'http://localhost:8080';
     }
     searchSettingsReady = true;
-    checkSearchBtn.disabled = false;
-    uploadBtn.disabled = !selectedFile;
     renderSearchSettings();
+    if (searchProvider === 'linkedin') await refreshLinkedInStatus();
   } catch (err) {
     setSearchStatus(err.message, 'error');
   }
 }
 
 checkSearchBtn.addEventListener('click', async () => {
-  if (searchProvider === 'searxng' && !searxngUrlInput.reportValidity()) return;
+  if (checkSearchBtn.disabled) return;
+  if (usesSearxng() && !searxngUrlInput.reportValidity()) return;
   const revision = settingsRevision;
   const provider = searchProvider;
-  checkSearchBtn.disabled = true;
-  setSearchStatus(`Testing ${provider === 'searxng' ? 'SearXNG' : 'Serper'}...`);
+  searchChecking = true;
+  updateSearchControls();
+  setSearchStatus(`Testing ${providerNames[provider]}...`);
   try {
     const res = await fetch('/api/search-check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, ...(provider === 'searxng' ? { searxngUrl: searxngUrlInput.value.trim() } : {}) }),
+      body: JSON.stringify({ provider, ...(['own', 'searxng', 'hybrid'].includes(provider) ? { searxngUrl: searxngUrlInput.value.trim() } : {}) }),
     });
     const data = await res.json();
+    if (provider === 'linkedin') linkedinConnection = { ...data, connected: Boolean(data.connected ?? data.ok) };
     if (revision !== settingsRevision) return;
-    if (!res.ok || !data.ok) throw new Error(data.error || 'Connection failed');
+    if (!res.ok || !data.ok) throw new Error(data.error || data.message || 'Connection failed');
     const warnings = data.warnings || [];
-    const message = warnings.length
-      ? `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connected with limited engines (${warnings.join('; ')})`
-      : `${provider === 'searxng' ? 'SearXNG' : 'Serper'} connection is working${data.credits == null ? '' : ` (${data.credits} credits left)`}`;
+    const message = provider === 'linkedin'
+      ? data.message || 'LinkedIn is connected. Ready to search without paid credits.'
+      : warnings.length
+      ? `${providerNames[provider]} connected with limited engines (${warnings.join('; ')})`
+      : data.respondingProvider
+        ? `${providerNames[provider]} ready: ${data.respondingProvider} responded first`
+        : `${providerNames[provider]} connection is working${data.credits == null ? '' : ` (${data.credits} credits left)`}`;
     setSearchStatus(message, warnings.length ? 'warning' : 'ok');
     showToast(message, true);
   } catch (err) {
+    if (provider === 'linkedin') linkedinConnection = { connected: false, message: err.message };
     if (revision === settingsRevision) setSearchStatus(err.message, 'error');
   } finally {
-    checkSearchBtn.disabled = false;
+    searchChecking = false;
+    updateSearchControls();
   }
 });
 

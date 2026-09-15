@@ -9,7 +9,8 @@
 const { searchWithFallbackQueries } = require('./search');
 const { pickLinkedInWithLlm } = require('./llm');
 const { companyTokensOf } = require('./person');
-const { brandTokens } = require('./normalize');
+const { brandTokens, companySearchName } = require('./normalize');
+const { currentSearchConfig } = require('./search-config');
 
 const BAD_LINKEDIN_PATHS = [
   '/posts/', '/pulse/', '/activity/', '/jobs/', '/learning/', '/company/',
@@ -169,7 +170,7 @@ function validateLinkedInCandidate(url, title, personName, companyName, snippet 
  * Find and validate a LinkedIn profile URL for one person.
  * Returns URL string or null.
  */
-async function findLinkedInProfile(personName, companyName, designation, log = () => {}) {
+async function findLinkedInProfile(personName, companyName, designation, log = () => {}, { signal } = {}) {
   // The full variant list runs regardless of search backend. It looks
   // expensive but isn't: the loop stops at the first query that yields an
   // accepted profile, so the extra variants are only ever spent on a lookup
@@ -184,7 +185,8 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
   const queries = [
     // Start with the company + name search a person would type. Exact quotes
     // can miss profiles whose names include additional words or initials.
-    `${String(companyName).trim()} ${personName}`,
+    `${personName} ${String(companyName).trim()}`,
+    `${personName} ${companySearchName(companyName)}`,
     `${brand} ${personName} LinkedIn`,
     // Narrow the search if broad results do not establish both identity and employer.
     `site:linkedin.com/in "${personName}" "${brand}"`,
@@ -206,12 +208,15 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
   // for two *any* profiles burned extra queries on every person, and the
   // resulting search volume is what gets the engines to throttle us on a
   // long company list — which then turns later lookups into NULLs.
-  const results = await searchWithFallbackQueries(() => queries, {
-    log,
-    accept: (r) =>
+  const accept = (r) =>
       isPersonalProfileUrl(r.url) &&
       hasCompanyEvidence(r, companyName) &&
-      validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) >= MATCH_THRESHOLD,
+      validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet) >= MATCH_THRESHOLD;
+  const results = currentSearchConfig().provider === 'linkedin'
+    ? await require('./linkedin-direct').searchLinkedInDirect({ personName, companyName, designation, log, accept, signal })
+    : await searchWithFallbackQueries(() => [...new Set(queries)], {
+    log,
+    accept,
     minAccepted: 1,
   });
 
@@ -234,7 +239,8 @@ async function findLinkedInProfile(personName, companyName, designation, log = (
 
   // Ambiguous: let the LLM adjudicate if it is configured.
   log(`    weak rule match (best score ${best ? best.score : 0}), trying LLM validation`);
-  const llmPick = await pickLinkedInWithLlm(personName, companyName, designation, profiles);
+  const llmPick = currentSearchConfig().provider === 'linkedin' ? null
+    : await pickLinkedInWithLlm(personName, companyName, designation, profiles);
   if (llmPick && isPersonalProfileUrl(llmPick)) {
     // The LLM decides *between* plausible candidates; it does not get to
     // overrule the surname rule. Without this a non-person that slipped
@@ -257,4 +263,5 @@ module.exports = {
   isPersonalProfileUrl,
   validateLinkedInCandidate,
   profileSlug,
+  hasCompanyEvidence,
 };

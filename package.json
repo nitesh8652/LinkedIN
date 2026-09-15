@@ -6,9 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test scripts/search-providers.test.js scripts/search-recovery.test.js scripts/searxng-suspensions.test.js scripts/search-routes.test.js scripts/zauba-linkedin.test.js scripts/sethu-linkedin.test.js scripts/zauba-directors.test.js scripts/zauba-snippets.test.js scripts/null-matching.test.js scripts/agent-completion.test.js scripts/agent-registry-fallback.test.js scripts/search-unavailable-rows.test.js scripts/agent-cancel.test.js scripts/cancel-job.test.js && node scripts/test-agent-flow.js && node scripts/test-rules.js",
+    "test": "node --test scripts/linkedin-direct.test.js scripts/excel-directors.test.js scripts/agent-linkedin-direct.test.js scripts/agent-partial-search.test.js scripts/own-search.test.js scripts/own-search-api.test.js scripts/hybrid-search.test.js scripts/serpapi.test.js scripts/search-providers.test.js scripts/search-recovery.test.js scripts/searxng-suspensions.test.js scripts/search-routes.test.js scripts/zauba-linkedin.test.js scripts/sethu-linkedin.test.js scripts/zauba-directors.test.js scripts/zauba-snippets.test.js scripts/null-matching.test.js scripts/agent-completion.test.js scripts/agent-registry-fallback.test.js scripts/search-unavailable-rows.test.js scripts/agent-cancel.test.js scripts/cancel-job.test.js && node scripts/test-agent-flow.js && node scripts/test-rules.js",
     "test:ui": "node scripts/test-search-ui.js && node --test scripts/zauba-section-ui.test.js",
-    "install-browser": "npx playwright install chromium"
+    "install-browser": "npx playwright install chromium",
+    "start:searxng": "node scripts/start-searxng.js",
+    "test:search:live": "node scripts/test-own-search-live.js"
   },
   "dependencies": {
     "cheerio": "^1.0.0",

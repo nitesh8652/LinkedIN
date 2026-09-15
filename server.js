@@ -11,8 +11,9 @@ const { v4: uuidv4 } = require('uuid');
 
 const { readCompaniesFromExcel, writeResultsToExcel } = require('./src/excel');
 const { runAgent } = require('./src/agent');
-const { verifySearchProvider, serperStatus } = require('./src/search');
+const { verifySearchProvider, serperStatus, serpapiStatus } = require('./src/search');
 const { resolveSearchConfig, withSearchConfig } = require('./src/search-config');
+const { connectLinkedIn, getLinkedInStatus, closeLinkedInBrowser } = require('./src/linkedin-direct');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -130,6 +131,7 @@ function createJob(jobId) {
 
 // ---------- Routes ----------
 
+require('./src/search-api').installSearchApi(app);
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -140,6 +142,7 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
       provider: req.body.searchProvider,
       searxngUrl: req.body.searxngUrl,
     });
+    if (searchOptions.provider === 'linkedin' && !allowLocalLinkedInAccess(req, res)) return;
 
     const companies = await readCompaniesFromExcel(req.file.path).catch((err) => {
       throw new Error(`Invalid Excel file: ${err.message}`);
@@ -196,9 +199,49 @@ app.post('/api/upload', upload.single('excel'), async (req, res) => {
 // Configuration reads never spend search credits. Connection tests are explicit.
 app.get('/api/search-config', (req, res) => {
   try {
-    res.json({ ...resolveSearchConfig(), serper: serperStatus() });
+    res.json({ ...resolveSearchConfig(), serper: serperStatus(), serpapi: serpapiStatus() });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+function allowLocalLinkedInAccess(req, res) {
+  const address = req.socket.remoteAddress || '';
+  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address)) {
+    res.status(403).json({ error: 'LinkedIn session controls are available only on this computer.' });
+    return false;
+  }
+  if (req.method === 'POST' && req.headers.origin) {
+    let sameOrigin = false;
+    try {
+      const origin = new URL(req.headers.origin);
+      sameOrigin = origin.origin === `${req.protocol}://${req.get('host')}`;
+    } catch { /* malformed or opaque origins are not local UI requests */ }
+    if (!sameOrigin) {
+      res.status(403).json({ error: 'Open LinkedIn from this app on this computer.' });
+      return false;
+    }
+  }
+  return true;
+}
+
+function requireLocalLinkedInAccess(req, res, next) {
+  if (allowLocalLinkedInAccess(req, res)) next();
+}
+
+app.get('/api/linkedin/status', requireLocalLinkedInAccess, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(await getLinkedInStatus()); } catch (err) {
+    res.status(500).json({ connected: false, error: err.message });
+  }
+});
+
+app.post('/api/linkedin/connect', requireLocalLinkedInAccess, async (req, res) => {
+  if ([...jobs.values()].some((job) => !['done', 'error', 'cancelled'].includes(job.status))) {
+    return res.status(409).json({ error: 'Wait for the current job to finish before opening the LinkedIn session.' });
+  }
+  try { res.json(await connectLinkedIn()); } catch (err) {
+    res.status(500).json({ connected: false, error: err.message });
   }
 });
 
@@ -207,6 +250,7 @@ app.post('/api/search-check', async (req, res) => {
   try { config = resolveSearchConfig(req.body); } catch (err) {
     return res.status(400).json({ ok: false, error: err.message });
   }
+  if (config.provider === 'linkedin' && !allowLocalLinkedInAccess(req, res)) return;
   const result = await withSearchConfig(config, () => verifySearchProvider());
   res.json({ provider: config.provider, ...result });
 });
@@ -277,9 +321,35 @@ app.use((err, req, res, next) => {
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`AI Company Research Agent running at http://localhost:${PORT}`);
   });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use — another instance is probably still running.`);
+      console.error(`Stop it, or start on another port:  PORT=3001 npm start`);
+      process.exit(1);
+    }
+    throw err;
+  });
+
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const job of jobs.values()) job.cancel();
+    const timeout = setTimeout(() => process.exit(0), 5000);
+    timeout.unref();
+    await Promise.allSettled([
+      new Promise((resolve) => server.close(resolve)),
+      closeLinkedInBrowser(),
+    ]);
+    clearTimeout(timeout);
+    process.exit(0);
+  }
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 module.exports = app;

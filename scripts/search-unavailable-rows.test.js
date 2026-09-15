@@ -72,12 +72,12 @@ async function run(options) {
   return { rows, logs };
 }
 
-test('website discovery outages are distinguished from genuine missing companies', async () => {
+test('website discovery outages try the registry before reporting an unavailable search', async () => {
   const { rows } = await run({ discoveryUnavailable: true });
   assert.equal(rows[0].status, 'search_unavailable');
   assert.equal(rows[0].personName, null);
   assert.match(rows[0].reason, /temporarily unavailable/);
-  assert.equal(calls.includes('registry'), false);
+  assert.equal(calls.includes('registry'), true);
 });
 
 test('website profile outages preserve all known names and earlier URLs without registry retries', async () => {
@@ -89,6 +89,14 @@ test('website profile outages preserve all known names and earlier URLs without 
   assert.equal(rows[0].linkedinUrl, foundUrl);
   assert.equal(calls.includes('website LinkedIn: Chetan Das'), false);
   assert.equal(calls.includes('registry'), false);
+});
+
+test('an official website search outage cannot suppress directors and profiles recovered through the registry', async () => {
+  const { rows } = await run({ discoveryUnavailable: true, directors: [person('Asha Rao')], registryMatches: { 'Asha Rao': foundUrl } });
+  assert.equal(rows[0].personName, 'Asha Rao');
+  assert.equal(rows[0].linkedinUrl, foundUrl);
+  assert.equal(rows[0].status, 'ok');
+  assert.equal(rows[0].source, 'ZaubaCorp');
 });
 
 test('an unavailable supplemental name search cannot erase an extracted website director', async () => {
@@ -152,10 +160,11 @@ test('Excel output labels unavailable searches and preserves the director name',
   const output = path.join(directory, 'report.xlsx');
   t.after(async () => { await fs.rm(output, { force: true }); await fs.rmdir(directory); });
   await writeResultsToExcel([{ companyName: 'Plasmagen Biosciences', personName: 'Sethu Madhavan',
-    designation: 'Chief Operating Officer', linkedinUrl: null, status: 'search_unavailable' }], output);
+    designation: 'Chief Operating Officer', linkedinUrl: null, status: 'search_unavailable', reason: 'SerpApi timed out; SearXNG offline' }], output);
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(output);
   const row = workbook.getWorksheet('Directors Report').getRow(2);
   assert.equal(row.getCell(2).value, 'Sethu Madhavan');
   assert.equal(row.getCell(6).value, 'Search temporarily unavailable');
+  assert.equal(row.getCell(10).value, 'SerpApi timed out; SearXNG offline');
 });

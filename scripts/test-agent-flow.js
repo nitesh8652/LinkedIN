@@ -56,7 +56,7 @@ const job = {
 };
 
 (async () => {
-  const rows = await runAgent(['Acme Industries'], job);
+  const rows = await runAgent(['Acme Industries'], job, { provider: 'own' });
   console.log('\n   rows:');
   for (const r of rows) {
     console.log(`   ${r.personName} | ${r.designation} | ${r.linkedinUrl || 'NULL'} | ${r.status}`);
