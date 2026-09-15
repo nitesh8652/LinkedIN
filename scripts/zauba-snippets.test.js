@@ -8,6 +8,9 @@ const searchFile = require.resolve('../src/search');
 require.cache[searchFile] = { id: searchFile, filename: searchFile, loaded: true, exports: {
   searchWithFallbackQueries: async (buildQueries) => {
     searchCalls.push(buildQueries());
+    if (scenario.searchUnavailable || (scenario.extraSearchUnavailable && searchCalls.length > 1)) {
+      throw Object.assign(new Error('Both search providers unavailable'), { code: 'SEARCH_UNAVAILABLE' });
+    }
     return searchCalls.length === 1 ? scenario.results : (scenario.extraResults || []);
   },
 } };
@@ -72,28 +75,50 @@ function mockRegistry(t, options) {
   const nativeTimeout = globalThis.setTimeout;
   t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => nativeTimeout(callback, ms < 12000 ? 0 : ms, ...args));
   let pageLoads = 0;
+  let currentUrl = '';
+  const navigations = [];
   const locator = { first() { return this; }, async waitFor() {}, async evaluate() {} };
   const page = {
     isClosed: () => false, async route() {}, async waitForTimeout() {},
-    async goto(url) { pageLoads++; assert.equal(url, `${companyUrl}#director-information`); return { status: () => options.blocked ? 403 : 200 }; },
+    async goto(url) {
+      pageLoads++; currentUrl = url; navigations.push(url);
+      if (!url.includes('/companysearchresults/')) assert.equal(url, `${companyUrl}#director-information`);
+      return { status: () => options.blocked ? 403 : 200 };
+    },
     async evaluate(fn) {
       if (String(fn).includes("document.getElementById('director-information')")) {
         return { present: /id="director-information"/.test(options.html || ''), clicked: false };
       }
       return options.blocked ? 'Just a moment. Checking your browser.' : 'Company details';
     },
-    locator: () => locator, async waitForFunction() {}, async content() { return options.html || '<p>Company details</p>'; },
+    locator: () => locator, async waitForFunction() {}, async content() {
+      if (currentUrl.includes('/companysearchresults/')) return `<a href="${companyUrl}">${companyName}</a>`;
+      return options.html || '<p>Company details</p>';
+    },
   };
   t.mock.method(chromium, 'launch', async () => ({
     async newContext() { return { async addInitScript() {}, async newPage() { return page; } }; },
     async close() {},
   }));
   t.after(closeZaubaBrowser);
-  return { pageLoads: () => pageLoads };
+  return { pageLoads: () => pageLoads, navigations };
 }
 
+test('ZaubaCorp own company search and Directors table still work when both web providers fail', async (t) => {
+  const browser = mockRegistry(t, { searchUnavailable: true,
+    html: '<section id="director-information"><h2>Current Directors</h2><table><tr><th>DIN</th><th>Director Name</th><th>Designation</th></tr>' +
+      '<tr><td>00127490</td><td>JITENDRA JAYANTILAL SHAH</td><td>Director</td></tr></table></section>',
+  });
+  const result = await findDirectorsOnZaubaCorp(companyName);
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.directors[0].name, 'JITENDRA JAYANTILAL SHAH');
+  assert.equal(result.directors[0].din, '00127490');
+  assert.match(browser.navigations[0], /companysearchresults\/TIMES-COMTRADE$/);
+  assert.equal(browser.navigations[1], `${companyUrl}#director-information`);
+});
+
 test('Cloudflare-blocked matched page recovers company directors already indexed in search', async (t) => {
-  const browser = mockRegistry(t, { blocked: true, results: [companyResult(), activeResult()] });
+  const browser = mockRegistry(t, { blocked: true, results: [companyResult(), activeResult()], extraSearchUnavailable: true });
   const result = await findDirectorsOnZaubaCorp(companyName);
   assert.equal(result.ok, true);
   assert.equal(result.directors[0].name, 'JITENDRA JAYANTILAL SHAH');
@@ -109,6 +134,52 @@ test('one focused registry search can recover names when the page has no Directo
   assert.equal(searchCalls.length, 2);
   assert.deepEqual(searchCalls[1], [`site:zaubacorp.com "${companyName}" "Director"`]);
   assert.equal(result.directors[0].source, 'ZaubaCorp (search result)');
+});
+
+test('supplemental search outage preserves the company match and distinguishes unavailable director evidence', async (t) => {
+  mockRegistry(t, { results: [companyResult()], extraSearchUnavailable: true });
+  const result = await findDirectorsOnZaubaCorp(companyName);
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, 'SEARCH_UNAVAILABLE');
+  assert.equal(result.pageUrl, `${companyUrl}#director-information`);
+  assert.equal(result.matchedName, companyName);
+  assert.equal(result.confidence, 'high');
+  assert.deepEqual(result.directors, []);
+  assert.match(result.reason, /company matched, but director information could not be recovered: Both search providers unavailable/);
+  assert.equal(searchCalls.length, 2);
+});
+
+test('direct company search match survives unavailable web search and missing director evidence', async (t) => {
+  const browser = mockRegistry(t, { searchUnavailable: true });
+  const result = await findDirectorsOnZaubaCorp(companyName);
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, 'SEARCH_UNAVAILABLE');
+  assert.equal(result.pageUrl, `${companyUrl}#director-information`);
+  assert.equal(result.matchedName, companyName);
+  assert.equal(result.confidence, 'high');
+  assert.match(browser.navigations[0], /companysearchresults/);
+});
+
+test('an empty authoritative Directors section remains missing data during a web search outage', async (t) => {
+  mockRegistry(t, { searchUnavailable: true,
+    html: '<section id="director-information"><h2>Directors</h2><p>No directors available</p></section>',
+  });
+  const result = await findDirectorsOnZaubaCorp(companyName);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'Directors unavailable');
+  assert.equal(result.errorCode, undefined);
+  assert.equal(result.pageUrl, `${companyUrl}#director-information`);
+  assert.equal(searchCalls.length, 1);
+});
+
+test('direct company search setup failure retains the original web search outage', async (t) => {
+  mockRegistry(t, { searchUnavailable: true });
+  t.mock.method(chromium, 'launch', async () => { throw new Error('Browser could not start'); });
+  const result = await findDirectorsOnZaubaCorp(companyName);
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, 'SEARCH_UNAVAILABLE');
+  assert.match(result.reason, /Both search providers unavailable/);
+  assert.match(result.reason, /ZaubaCorp site search could not be loaded: Browser could not start/);
 });
 
 test('an explicitly present empty Directors section is never replaced by indexed names', async (t) => {

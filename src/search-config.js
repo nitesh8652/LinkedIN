@@ -4,10 +4,11 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const searchContext = new AsyncLocalStorage();
 
 function resolveSearchConfig(options = {}) {
-  const provider = options.provider ?? process.env.SEARCH_PROVIDER ?? 'serper';
-  if (!['serper', 'searxng'].includes(provider)) {
-    throw new Error('Search provider must be serper or searxng');
+  const provider = options.provider ?? process.env.SEARCH_PROVIDER ?? 'linkedin';
+  if (!['linkedin', 'own', 'serper', 'serpapi', 'searxng', 'hybrid'].includes(provider)) {
+    throw new Error('Search provider must be linkedin, own, serper, serpapi, searxng or hybrid');
   }
+  if (provider === 'linkedin') return Object.freeze({ provider });
   const rawUrl = options.searxngUrl ?? process.env.SEARXNG_URL ?? 'http://localhost:8080';
   let url;
   try { url = new URL(String(rawUrl).trim()); } catch {
@@ -35,7 +36,7 @@ function noteSearchProvider(provider) {
 }
 
 function searchProviderLabel() {
-  const label = currentSearchConfig().provider === 'searxng' ? 'SearXNG' : 'Serper (Google API)';
+  const label = { linkedin: 'LinkedIn Direct (no search API)', own: 'Own Search (SearXNG + direct engines)', serper: 'Serper (Google API)', serpapi: 'SerpApi (Google API)', searxng: 'SearXNG', hybrid: 'SerpApi + SearXNG (parallel)' }[currentSearchConfig().provider];
   return searchContext.getStore()?.used.has('scraped engines') ? `${label} + scraped fallback engines` : label;
 }
 

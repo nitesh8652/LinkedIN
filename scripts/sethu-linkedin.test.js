@@ -47,7 +47,7 @@ test('observed Sethu Madhavan profile matches the shorter name on the official w
 });
 
 test('website lookup finds the full LinkedIn name through a plain company plus name query', async (t) => {
-  const fixture = useSearchFixture(t, (query) => query === `${company} ${name}` ? [
+  const fixture = useSearchFixture(t, (query) => query === `${name} ${company}` ? [
     { url: 'https://plasmagen.com/lead_desc/Sethu%20Madhavan', title: 'Sethu Madhavan - PlasmaGen' },
     { url: 'https://in.linkedin.com/company/plasmagen-biosciences', title: observed.title },
     { url: 'https://in.linkedin.com/in/unrelated-colleague-fixture', title: 'Another Person - PlasmaGen BioSciences', content: 'Worked with Sethu Madhavan.' },
@@ -55,7 +55,7 @@ test('website lookup finds the full LinkedIn name through a plain company plus n
   ] : []);
   const result = await fixture.run(() => findLinkedInProfile(name, company, 'Chief Operating Officer'));
   assert.equal(result, observed.url);
-  assert.deepEqual(fixture.queries, [`${company} ${name}`]);
+  assert.deepEqual(fixture.queries, [`${name} ${company}`]);
   assert.equal(llmCalls, 0);
 });
 
@@ -78,7 +78,7 @@ test('unquoted LinkedIn site search runs when the quoted spelling produces no pr
 test('a same-name profile at another employer cannot stop the fallback searches', async (t) => {
   const wrong = { ...observed, url: 'https://in.linkedin.com/in/sethu-madhavan-unrelated',
     title: 'Sethu Madhavan - Elsewhere Biosciences | LinkedIn', content: 'COO at Elsewhere Biosciences.' };
-  const fixture = useSearchFixture(t, (query) => query === `${company} ${name}` ? [wrong] : [observed]);
+  const fixture = useSearchFixture(t, (query) => query === `${name} ${company}` ? [wrong] : [observed]);
   assert.equal(await fixture.run(() => findLinkedInProfile(name, company, 'COO')), observed.url);
   assert.equal(fixture.queries.length, 2);
 });

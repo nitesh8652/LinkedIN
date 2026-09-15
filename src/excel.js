@@ -6,8 +6,9 @@ const ExcelJS = require('exceljs');
 
 /**
  * Read company names from the first worksheet of an uploaded .xlsx file.
- * Finds the column containing "company" in its header, else uses the
- * first non-empty column. Returns unique display names (case-insensitive dedupe).
+ * Finds an explicit company header, else uses the first non-empty column.
+ * Company-only entries remain strings. Rows with an explicit person-name column
+ * become { companyName, directors: [{ name, designation }] }, grouped by company.
  */
 async function readCompaniesFromExcel(filePath) {
   const workbook = new ExcelJS.Workbook();
@@ -16,17 +17,28 @@ async function readCompaniesFromExcel(filePath) {
   const ws = workbook.worksheets[0];
   if (!ws) throw new Error('Excel file has no worksheets');
 
-  const companies = [];
-  const seen = new Set();
+  const companies = new Map();
+
+  const cellText = (value) => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'object') {
+      if (Array.isArray(value.richText)) return value.richText.map((part) => cellText(part.text)).join('');
+      return cellText(value.text ?? value.result);
+    }
+    return String(value);
+  };
+  const normalizeText = (value) => cellText(value).replace(/\s+/g, ' ').trim();
 
   // Detect header row + column
   let companyCol = null;
+  let directorCol = null;
+  let designationCol = null;
   let startRow = 1;
 
   ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
     if (rowNumber > 5 || companyCol) return;
     row.eachCell((cell, colNumber) => {
-      const v = String(cell.value ?? '').trim().toLowerCase();
+      const v = normalizeText(cell.value).toLowerCase();
       if (v === 'company' || v === 'company name' || v === 'companies' ||
           v === 'company_name' || v === 'organisation' || v === 'organization') {
         companyCol = colNumber;
@@ -34,6 +46,20 @@ async function readCompaniesFromExcel(filePath) {
       }
     });
   });
+
+  if (companyCol) {
+    const headers = new Map();
+    ws.getRow(startRow - 1).eachCell((cell, colNumber) => {
+      const header = normalizeText(cell.value).toLowerCase();
+      if (!headers.has(header)) headers.set(header, colNumber);
+    });
+    // An exact header prevents unrelated columns (e.g. emails or notes) from
+    // being interpreted as people. Prefer specific headers over generic Name.
+    directorCol = ['director name', 'director', 'person name', 'name']
+      .map((header) => headers.get(header)).find(Boolean) || null;
+    designationCol = ['designation', 'role', 'title']
+      .map((header) => headers.get(header)).find(Boolean) || null;
+  }
 
   ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
     let raw = null;
@@ -43,26 +69,36 @@ async function readCompaniesFromExcel(filePath) {
       // take first non-empty cell in the row
       for (let c = 1; c <= Math.min(row.cellCount, 10); c++) {
         const val = row.getCell(c).value;
-        if (val !== null && val !== undefined && String(val).trim() !== '') {
+        if (normalizeText(val)) {
           raw = val;
           break;
         }
       }
     }
     if (raw === null || raw === undefined) return;
-    let text = typeof raw === 'object' ? (raw.text ?? raw.result ?? '') : raw;
-    text = String(text ?? '').replace(/\s+/g, ' ').trim();
+    const text = normalizeText(raw);
     if (!text || text.length < 2 || text.length > 150) return;
     // skip header-looking values
     if (/^compan(y|ies)\s*name?$/i.test(text)) return;
     const key = text.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    companies.push(text);
+    if (!companies.has(key)) companies.set(key, { companyName: text, directors: new Map() });
+    if (!directorCol) return;
+
+    const name = normalizeText(row.getCell(directorCol).value);
+    if (name.length < 2 || name.length > 150 || /^(?:null|n\/?a|not found)$/i.test(name)) return;
+    const designation = designationCol ? normalizeText(row.getCell(designationCol).value) : '';
+    const entry = companies.get(key);
+    const nameKey = name.toLowerCase();
+    if (!entry.directors.has(nameKey)) entry.directors.set(nameKey, { name, designation });
+    else if (!entry.directors.get(nameKey).designation && designation) {
+      entry.directors.get(nameKey).designation = designation;
+    }
   });
 
-  if (companies.length === 0) throw new Error('No company names found in the Excel file');
-  return companies;
+  if (companies.size === 0) throw new Error('No company names found in the Excel file');
+  return [...companies.values()].map(({ companyName, directors }) => directors.size
+    ? { companyName, directors: [...directors.values()] }
+    : companyName);
 }
 
 const NULL_VALUE = 'NULL';
@@ -113,6 +149,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
     { header: 'DIN / DPIN', key: 'din', width: 16 },
     { header: 'Appointment Date', key: 'appointmentDate', width: 22 },
     { header: 'Source URL', key: 'sourceUrl', width: 48 },
+    { header: 'Search Details', key: 'reason', width: 65 },
   ];
 
   for (const r of rows) {
@@ -126,6 +163,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
       din: r.din || NULL_VALUE,
       appointmentDate: r.appointmentDate || NULL_VALUE,
       sourceUrl: r.sourceUrl || NULL_VALUE,
+      reason: r.reason || '',
     });
   }
 
@@ -139,7 +177,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
   // Borders + alternating fill
   for (let i = 2; i <= ws.rowCount; i++) {
     const row = ws.getRow(i);
-    row.alignment = { vertical: 'middle' };
+    row.alignment = { vertical: 'middle', wrapText: true };
     row.eachCell((cell) => {
       cell.border = {
         top: { style: 'thin', color: { argb: 'FFD1D5DB' } },
@@ -156,7 +194,7 @@ async function writeResultsToExcel(rows, outPath, meta = {}) {
   }
 
   ws.views = [{ state: 'frozen', ySplit: 1 }];
-  ws.autoFilter = { from: 'A1', to: 'I1' };
+  ws.autoFilter = { from: 'A1', to: 'J1' };
 
   // Summary sheet
   const sumWs = workbook.addWorksheet('Summary');

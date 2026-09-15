@@ -16,6 +16,9 @@ const app = require('../server');
     let polls = 0;
     let pollStreams = 0;
     let cancelPosts = 0;
+    let linkedinConnects = 0;
+    let linkedinConnected = false;
+    let linkedinPolls = 0;
     const row = { companyName: 'Acme', personName: 'Asha Rao', designation: 'Director', linkedinUrl: 'https://linkedin.com/in/asha-rao', source: 'ZaubaCorp', status: 'ok', din: '00001234', appointmentDate: '20/09/2006', sourceUrl: 'https://www.zaubacorp.com/company#director-information' };
     const event = (type, data) => `data: ${JSON.stringify({ type, ...data })}\n\n`;
     page.on('pageerror', (error) => errors.push(error.message));
@@ -25,18 +28,79 @@ const app = require('../server');
       if (url.origin !== origin) return route.abort();
       if (url.pathname === '/api/serper-check') throw new Error('Unexpected automatic Serper check');
       if (url.pathname === '/api/search-config') return route.fulfill({ json: {
-        provider: 'serper', searxngUrl: 'http://localhost:8080/search', serper: { configured: true },
+        provider: 'serper', searxngUrl: 'http://localhost:8080/search', serper: { configured: true }, serpapi: { configured: true },
       } });
+      if (url.pathname === '/api/linkedin/status') return route.fulfill({ json: {
+        connected: linkedinConnected, status: linkedinConnected ? 'connected' : 'login_required',
+        message: linkedinConnected ? 'LinkedIn connected' : 'Connect LinkedIn and sign in, then test the connection.',
+      } });
+      if (url.pathname === '/api/linkedin/connect') {
+        assert.equal(request.method(), 'POST');
+        linkedinConnects++;
+        return route.fulfill({ json: { connected: false, status: 'login_required', message: 'Sign in in the browser, then test the connection.' } });
+      }
       if (url.pathname === '/api/search-check') {
         checks.push(request.postDataJSON());
-        return route.fulfill({ json: { provider: checks.at(-1).provider, ok: true } });
+        if (checks.at(-1).provider === 'linkedin') linkedinConnected = true;
+        return route.fulfill({ json: { provider: checks.at(-1).provider, ok: true,
+          ...(checks.at(-1).provider === 'linkedin' ? { connected: true, message: 'LinkedIn connected. No paid credits are used.' } : {}),
+          ...(checks.at(-1).provider === 'hybrid' ? { respondingProvider: 'SearXNG' } : {}),
+        } });
       }
       if (url.pathname === '/api/upload') {
+        if (uploads === 7) {
+          assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nlinkedin/);
+          assert.doesNotMatch(request.postDataBuffer().toString(), /name="searxngUrl"/);
+          uploads++;
+          return route.fulfill({ json: { jobId: 'ui-linkedin', companiesFound: 1, companies: ['Acme'] } });
+        }
+        if (uploads === 6) {
+          assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nown/);
+          assert.match(request.postDataBuffer().toString(), /http:\/\/localhost:9999/);
+          uploads++;
+          return route.fulfill({ json: { jobId: 'ui-own', companiesFound: 1, companies: ['Acme'] } });
+        }
+        if (uploads === 5) {
+          assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nhybrid/);
+          assert.match(request.postDataBuffer().toString(), /http:\/\/localhost:9999/);
+          uploads++;
+          return route.fulfill({ json: { jobId: 'ui-hybrid', companiesFound: 1, companies: ['Acme'] } });
+        }
+        if (uploads === 4) {
+          assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nserpapi/);
+          assert.doesNotMatch(request.postDataBuffer().toString(), /name="searxngUrl"/);
+          uploads++;
+          return route.fulfill({ json: { jobId: 'ui-serpapi', companiesFound: 1, companies: ['Acme'] } });
+        }
         assert.match(request.postDataBuffer().toString(), /name="searchProvider"\r\n\r\nsearxng/);
         assert.match(request.postDataBuffer().toString(), /http:\/\/localhost:9999/);
         const jobId = ['ui-test', 'ui-poll', 'ui-error', 'ui-cancel'][uploads++];
         return route.fulfill({ json: { jobId, companiesFound: 2, companies: ['Acme', 'Fable'] } });
       }
+      if (url.pathname === '/api/events/ui-linkedin') return route.fulfill({
+        contentType: 'text/event-stream', body: event('rows', { rows: [row] }) +
+          event('state', { state: { status: 'running', rowsCount: 1, meta: { searchProvider: 'LinkedIn Direct' } } }),
+      });
+      if (url.pathname === '/api/status/ui-linkedin') {
+        linkedinPolls++;
+        return route.fulfill({ json: {
+          status: linkedinPolls >= 2 ? 'done' : 'running', rowsCount: 1, rows: [row], logs: [],
+          hasOutput: linkedinPolls >= 2, meta: { searchProvider: 'LinkedIn Direct' },
+        } });
+      }
+      if (url.pathname === '/api/events/ui-own') return route.fulfill({
+        contentType: 'text/event-stream', body: event('rows', { rows: [row] }) +
+          event('state', { state: { status: 'done', hasOutput: true, meta: { searchProvider: 'Own Search (SearXNG + direct engines)' } } }),
+      });
+      if (url.pathname === '/api/events/ui-serpapi') return route.fulfill({
+        contentType: 'text/event-stream', body: event('rows', { rows: [row] }) +
+          event('state', { state: { status: 'done', hasOutput: true, meta: { searchProvider: 'SerpApi (Google API)' } } }),
+      });
+      if (url.pathname === '/api/events/ui-hybrid') return route.fulfill({
+        contentType: 'text/event-stream', body: event('rows', { rows: [
+          row, { ...row, personName: 'Bimal Shah', linkedinUrl: null, status: 'search_unavailable', reason: 'Both providers unavailable: SerpApi quota exhausted; SearXNG offline' },
+        ] }) + event('state', { state: { status: 'done', hasOutput: true, meta: { searchProvider: 'SerpApi + SearXNG (parallel)' } } }),
+      });
       if (url.pathname === '/api/events/ui-test') return route.fulfill({
         contentType: 'text/event-stream',
         body: event('logs', { lines: ['DONE - report ready for download'] }) +
@@ -86,6 +150,10 @@ const app = require('../server');
     await page.goto(origin);
     await page.waitForFunction(() => !document.getElementById('checkSearchBtn').disabled);
     assert.equal(checks.length, 0);
+    assert.equal(await page.locator('[data-provider="linkedin"]').getAttribute('aria-pressed'), 'true', 'unsaved browsers default to LinkedIn Direct, including an old server provider setting');
+    assert.equal(await page.locator('#linkedinSettings').isVisible(), true);
+    assert.equal(await page.locator('#searxngSettings').isVisible(), false);
+    assert.equal(linkedinConnects, 0, 'loading the page must not launch LinkedIn');
     await page.getByRole('button', { name: 'SearXNG No Serper credits' }).click();
     await page.getByLabel('SearXNG instance URL').fill('http://localhost:9999');
     await page.getByRole('button', { name: 'Test connection' }).click();
@@ -151,8 +219,84 @@ const app = require('../server');
     await page.getByRole('button', { name: 'Serper Uses API credits' }).click();
     assert.equal(await page.locator('#searxngSettings').isVisible(), false);
     assert.equal(await page.locator('#jobSearchProvider').textContent(), 'Search: SearXNG');
+    await page.locator('[data-provider="serpapi"]').click();
+    assert.match(await page.locator('#searchStatus').textContent(), /SerpApi key configured/);
+    assert.equal(await page.locator('#searxngSettings').isVisible(), false);
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await page.waitForFunction(() => document.getElementById('searchStatus').dataset.state === 'ok');
+    assert.deepEqual(checks.at(-1), { provider: 'serpapi' });
+    assert.match(await page.locator('#searchStatus').textContent(), /SerpApi connection is working/);
+    await page.reload();
+    await page.waitForFunction(() => !document.getElementById('checkSearchBtn').disabled);
+    assert.equal(await page.locator('[data-provider="serpapi"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(checks.length, 2, 'SerpApi reload must not spend credits');
+    await page.locator('#fileInput').setInputFiles({ name: 'companies.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from('mocked upload') });
+    await page.getByRole('button', { name: 'Upload & Start Processing' }).click();
+    await page.waitForFunction(() => document.getElementById('jobSearchProvider').textContent === 'Search: SerpApi (Google API)');
+    assert.equal(await page.locator('#resultsTable tbody tr').count(), 1);
+    assert.equal(await page.locator('#downloadBtn').getAttribute('href'), '/api/download/ui-serpapi');
+    await page.locator('[data-provider="hybrid"]').click();
+    assert.equal(await page.locator('#searxngSettings').isVisible(), true);
+    assert.match(await page.locator('#searchStatus').textContent(), /both providers in parallel/);
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await page.waitForFunction(() => document.getElementById('searchStatus').dataset.state === 'ok');
+    assert.deepEqual(checks.at(-1), { provider: 'hybrid', searxngUrl: 'http://localhost:9999' });
+    assert.match(await page.locator('#searchStatus').textContent(), /SearXNG responded first/);
+    await page.reload();
+    await page.waitForFunction(() => !document.getElementById('checkSearchBtn').disabled);
+    assert.equal(await page.locator('[data-provider="hybrid"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(checks.length, 3, 'combined mode must not run paid searches on reload');
+    await page.locator('#fileInput').setInputFiles({ name: 'companies.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from('mocked upload') });
+    await page.getByRole('button', { name: 'Upload & Start Processing' }).click();
+    await page.waitForFunction(() => document.getElementById('jobSearchProvider').textContent === 'Search: SerpApi + SearXNG (parallel)');
+    assert.equal(await page.locator('#resultsTable tbody tr').count(), 2);
+    assert.match(await page.locator('.status-detail').textContent(), /SerpApi quota exhausted; SearXNG offline/);
+    await page.locator('[data-provider="own"]').click();
+    assert.equal(await page.locator('#searxngSettings').isVisible(), true);
+    assert.match(await page.locator('#searchStatus').textContent(), /No paid search key/);
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await page.waitForFunction(() => document.getElementById('searchStatus').dataset.state === 'ok');
+    assert.deepEqual(checks.at(-1), { provider: 'own', searxngUrl: 'http://localhost:9999' });
+    await page.reload();
+    await page.waitForFunction(() => !document.getElementById('checkSearchBtn').disabled);
+    assert.equal(await page.locator('[data-provider="own"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(checks.length, 4, 'Own Search reload must not run hidden searches');
+    await page.locator('#fileInput').setInputFiles({ name: 'companies.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from('mocked upload') });
+    await page.getByRole('button', { name: 'Upload & Start Processing' }).click();
+    await page.waitForFunction(() => document.getElementById('jobSearchProvider').textContent === 'Search: Own Search (SearXNG + direct engines)');
+    assert.equal(await page.locator('#resultsTable tbody tr').count(), 1);
+    assert.equal(await page.locator('#downloadBtn').getAttribute('href'), '/api/download/ui-own');
+    await page.screenshot({ path: 'outputs/own-search-ui.png', fullPage: true });
+    await page.locator('[data-provider="linkedin"]').click();
+    assert.equal(await page.locator('#linkedinSettings').isVisible(), true);
+    assert.equal(await page.locator('#searxngSettings').isVisible(), false);
+    assert.equal(await page.locator('#uploadBtn').isDisabled(), true, 'Direct uploads wait for a signed-in connection');
+    await page.getByRole('button', { name: 'Connect LinkedIn', exact: true }).click();
+    await page.waitForFunction(() => document.getElementById('searchStatus').textContent.includes('Sign in in the browser'));
+    assert.equal(linkedinConnects, 1);
+    assert.equal(await page.locator('#uploadBtn').isDisabled(), true, 'opening a login window is not a signed-in session');
+    await page.getByRole('button', { name: 'Test connection' }).click();
+    await page.waitForFunction(() => document.getElementById('searchStatus').dataset.state === 'ok');
+    assert.deepEqual(checks.at(-1), { provider: 'linkedin' });
+    assert.equal(await page.locator('#uploadBtn').isDisabled(), false);
+    await page.getByRole('button', { name: 'Upload & Start Processing' }).click();
+    await page.waitForFunction(() => document.getElementById('jobSearchProvider').textContent === 'Search: LinkedIn Direct');
+    assert.equal(await page.locator('#connectLinkedinBtn').isDisabled(), true, 'session controls are disabled during research');
+    assert.equal(await page.locator('#checkSearchBtn').isDisabled(), true);
+    assert.equal(await page.locator('#uploadBtn').isDisabled(), true, 'only one job runs from this tab at a time');
+    await page.waitForFunction(() => document.getElementById('progressText').textContent === 'Complete!');
+    assert.equal(await page.locator('#connectLinkedinBtn').isDisabled(), false);
+    assert.equal(await page.locator('#uploadBtn').isDisabled(), false, 'a completed Direct job can be followed by another upload');
+    assert.equal(await page.locator('#downloadBtn').getAttribute('href'), '/api/download/ui-linkedin');
+    await page.screenshot({ path: 'outputs/linkedin-direct-ui.png', fullPage: true });
+    await page.reload();
+    await page.waitForFunction(() => document.getElementById('searchStatus').dataset.state === 'ok');
+    assert.equal(await page.locator('[data-provider="linkedin"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(checks.length, 5, 'Direct reload reads session status without running searches');
+    assert.equal(linkedinConnects, 1, 'Direct reload must not reopen LinkedIn');
     await page.setViewportSize({ width: 375, height: 812 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await page.screenshot({ path: 'outputs/linkedin-direct-ui-mobile.png', fullPage: true });
     assert.deepEqual(errors, []);
     console.log('PASS: provider controls, completed replay, accurate progress, polling retries without duplicates, cancellation with a partial report, terminal shutdown, counter resets, and mobile layout');
   } finally {

@@ -26,7 +26,8 @@ const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 
 const { searchWithFallbackQueries } = require('./search');
-const { brandTokens } = require('./normalize');
+const { currentSearchConfig } = require('./search-config');
+const { brandTokens, companySearchName } = require('./normalize');
 const { isPersonalProfileUrl, validateLinkedInCandidate } = require('./linkedin');
 const {
   cleanName,
@@ -401,7 +402,7 @@ async function searchZaubaCandidates(companyName, log) {
   const brand = brandTokens(companyName).join(' ') || companyName;
   const results = await searchWithFallbackQueries(
     () => [
-      `site:zaubacorp.com "${companyName}"`,
+      `site:zaubacorp.com "${companySearchName(companyName)}"`,
       `site:zaubacorp.com "${brand}"`,
       `zaubacorp "${companyName}" directors`,
       `zaubacorp ${brand} company directors`,
@@ -731,14 +732,26 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
   try {
     log('ZaubaCorp fallback: searching company registry...');
 
-    const { candidates, results: searchResults } = await searchZaubaCandidates(companyName, log);
+    let candidates = [], searchResults = [], searchError = null;
+    try {
+      ({ candidates, results: searchResults } = await searchZaubaCandidates(companyName, log));
+    } catch (err) {
+      if (err.code !== 'SEARCH_UNAVAILABLE') throw err;
+      searchError = err;
+      log(`  web search unavailable (${err.message}); trying ZaubaCorp's own company search`);
+    }
     log(`  ${candidates.length} ZaubaCorp page candidate(s) from web search`);
 
     let best = pickBestCandidate(companyName, candidates, log);
     let anyCandidate = candidates.length > 0;
+    let directError = null;
 
     if (!best) {
-      const direct = await searchZaubaDirectly(companyName, log);
+      let direct = [];
+      try { direct = await searchZaubaDirectly(companyName, log); } catch (err) {
+        directError = err;
+        log(`    ZaubaCorp site search could not be loaded: ${err.message}`);
+      }
       if (direct.length) {
         log(`  ${direct.length} candidate(s) from ZaubaCorp site search`);
         anyCandidate = true;
@@ -747,7 +760,11 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
     }
 
     if (!best) {
-      return fail(anyCandidate ? 'Company match confidence too low' : 'ZaubaCorp page not found');
+      return fail(searchError ? `ZaubaCorp company search could not recover after: ${searchError.message}` +
+        (directError ? `; ZaubaCorp site search could not be loaded: ${directError.message}` : '')
+        : directError ? `ZaubaCorp site search could not be loaded: ${directError.message}`
+          : anyCandidate ? 'Company match confidence too low' : 'ZaubaCorp page not found',
+      searchError ? { errorCode: 'SEARCH_UNAVAILABLE' } : {});
     }
 
     log(
@@ -762,6 +779,7 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
     }
 
     let directors = html ? parseDirectorsFromHtml(html, companyName) : [];
+    let directorSearchError = null;
     const hasDirectorSection = Boolean(html && cheerio.load(html)(DIRECTOR_SECTION).length);
     // An explicitly present empty Directors section remains authoritative.
     // Indexed snippets are a recovery path only when the page/section is absent.
@@ -769,18 +787,28 @@ async function findDirectorsOnZaubaCorp(companyName, log = () => {}) {
       log('    checking indexed ZaubaCorp results for explicit director names');
       directors = parseDirectorsFromSearchResults(searchResults, companyName);
       if (!directors.length) {
-        const extraResults = await searchWithFallbackQueries(
-          () => [`site:zaubacorp.com "${best.altName || companyName}" "Director"`],
-          { log, accept: (r) => parseDirectorsFromSearchResults([r], companyName).length > 0, minAccepted: 1 }
-        );
-        directors = parseDirectorsFromSearchResults(extraResults, companyName);
+        try {
+          const extraResults = await searchWithFallbackQueries(
+            () => [`site:zaubacorp.com "${best.altName || companyName}" "Director"`],
+            { log, accept: (r) => parseDirectorsFromSearchResults([r], companyName).length > 0, minAccepted: 1 }
+          );
+          directors = parseDirectorsFromSearchResults(extraResults, companyName);
+        } catch (err) {
+          if (err.code !== 'SEARCH_UNAVAILABLE') throw err;
+          directorSearchError = err;
+          log(`    indexed ZaubaCorp director search unavailable: ${err.message}`);
+        }
       }
     }
     if (!directors.length) {
-      return fail(html ? 'Directors unavailable' : 'ZaubaCorp page could not be loaded; indexed results did not identify directors', {
+      const reason = directorSearchError
+        ? `ZaubaCorp company matched, but director information could not be recovered: ${directorSearchError.message}`
+        : html ? 'Directors unavailable' : 'ZaubaCorp page could not be loaded; indexed results did not identify directors';
+      return fail(reason, {
         pageUrl,
         matchedName: best.candidateName,
         confidence: best.match.confidence,
+        ...(directorSearchError ? { errorCode: 'SEARCH_UNAVAILABLE' } : {}),
       });
     }
 
@@ -849,8 +877,9 @@ function companyEvidence(result, companyName) {
  *            information (snippet)
  *   none   - no result proved BOTH the person and the employer
  */
-async function verifyDirectorOnLinkedIn(personName, companyName, designation, log = () => {}) {
-  const brand = brandTokens(companyName).join(' ') || companyName;
+async function verifyDirectorOnLinkedIn(personName, companyName, designation, log = () => {}, { matchedCompanyName = '' } = {}) {
+  const verifiedCompany = matchedCompanyName || companySearchName(companyName);
+  const brand = brandTokens(verifiedCompany).join(' ') || verifiedCompany;
   const role = designation || 'Director';
   const name = cleanName(personName).replace(/\s+/g, ' ').trim();
   const parts = name.split(' ');
@@ -859,9 +888,10 @@ async function verifyDirectorOnLinkedIn(personName, companyName, designation, lo
   const shortName = parts.length > 2 ? `${parts[0]} ${parts.at(-1)}` : name;
   const names = [...new Set([name, shortName])];
 
-  const queries = [
+  const queries = [...new Set([
     // Start with the same broad search a person would type into Google.
-    ...names.map((n) => `${companyName.trim()} ${n}`),
+    `${name} ${companyName.trim()}`,
+    ...names.map((n) => `${n} ${verifiedCompany}`),
     ...names.map((n) => `${brand} ${n} LinkedIn`),
     ...names.map((n) => `site:linkedin.com/in "${n}" "${brand}"`),
     ...names.map((n) => `site:linkedin.com/in ${n} ${brand}`),
@@ -870,19 +900,21 @@ async function verifyDirectorOnLinkedIn(personName, companyName, designation, lo
     // A name-only search can surface Experience snippets omitted by a
     // company-scoped query. Acceptance still requires employer evidence.
     ...names.map((n) => `site:linkedin.com/in "${n}"`),
-  ];
+  ])];
 
-  const score = (r) => validateLinkedInCandidate(r.url, r.title, personName, companyName, r.snippet);
+  const score = (r) => validateLinkedInCandidate(r.url, r.title, personName, verifiedCompany, r.snippet);
   const accept = (r) => {
     if (!isPersonalProfileUrl(r.url)) return false;
     if (score(r) < LINKEDIN_MATCH_THRESHOLD) {
       return false;
     }
-    const evidence = companyEvidence(r, companyName);
+    const evidence = companyEvidence(r, verifiedCompany);
     return evidence.inTitle || evidence.inSnippet;
   };
 
-  const results = await searchWithFallbackQueries(() => queries, {
+  const results = currentSearchConfig().provider === 'linkedin'
+    ? await require('./linkedin-direct').searchLinkedInDirect({ personName: name, companyName: verifiedCompany, designation: role, log, accept })
+    : await searchWithFallbackQueries(() => queries, {
     accept,
     minAccepted: 1,
     searxngEngines: LINKEDIN_SEARCH_ENGINES,
@@ -903,7 +935,7 @@ async function verifyDirectorOnLinkedIn(personName, companyName, designation, lo
     .map((r) => ({
       ...r,
       score: score(r),
-      evidence: companyEvidence(r, companyName),
+      evidence: companyEvidence(r, verifiedCompany),
     }))
     // Title evidence outranks snippet evidence at equal name confidence.
     .sort(

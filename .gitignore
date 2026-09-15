@@ -3,6 +3,7 @@ node_modules/
 uploads/
 outputs/
 *.log
+.linkedin-profile/
 
 # Local SearXNG instance config; settings.yml holds a generated secret_key.
 searxng/
