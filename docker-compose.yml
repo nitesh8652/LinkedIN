@@ -1,0 +1,63 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: linkedinauto-app:latest
+    container_name: linkedinauto-app
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      PORT: 3000
+      # Inside compose, SearXNG is reachable as http://searxng:8080.
+      # If you run SearXNG on the host (not in compose), set in .env:
+      #   SEARXNG_URL=http://host.docker.internal:8080
+      # and uncomment extra_hosts below.
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-serper}
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      SEARXNG_ENGINES: ${SEARXNG_ENGINES:-google,bing}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+    depends_on:
+      searxng:
+        condition: service_healthy
+    restart: unless-stopped
+    # Needed only if SEARXNG_URL points to host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  searxng:
+    # Pulled from GitHub Container Registry: Docker Hub (registry-1.docker.io)
+    # is unreliable behind Docker Desktop's hub proxy on some networks and
+    # fails the blob download with "http: server gave HTTP response to HTTPS
+    # client". ghcr.io mirrors the same official image.
+    image: ghcr.io/searxng/searxng:latest
+    container_name: linkedinauto-searxng
+    ports:
+      - "${SEARXNG_PORT:-8080}:8080"
+    # Mount only settings.yml so container defaults (uwsgi.ini, etc.) are preserved.
+    # Requires host file ./searxng/settings.yml to exist (already created).
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || wget -qO- http://localhost:8080/ | grep -qi searxng || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s

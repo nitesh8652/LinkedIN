@@ -206,8 +206,16 @@ app.get('/api/search-config', (req, res) => {
 });
 
 function allowLocalLinkedInAccess(req, res) {
-  const address = req.socket.remoteAddress || '';
-  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address)) {
+  const raw = req.socket.remoteAddress || '';
+  const ip = raw.replace(/^::ffff:/, '');
+  const isLoopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(raw) || ip === '127.0.0.1';
+  const isPrivate =
+    /^10\.\d+\.\d+\.\d+$/.test(ip) ||
+    /^192\.168\.\d+\.\d+$/.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(ip);
+  // Allow LAN/WiFi access via IP (e.g. http://10.0.0.10:3001). Set ALLOW_LINKEDIN_REMOTE=0 to re-lock to localhost only.
+  const allowRemote = process.env.ALLOW_LINKEDIN_REMOTE !== '0';
+  if (!isLoopback && !(allowRemote && isPrivate)) {
     res.status(403).json({ error: 'LinkedIn session controls are available only on this computer.' });
     return false;
   }
@@ -321,8 +329,12 @@ app.use((err, req, res, next) => {
 });
 
 if (require.main === module) {
-  const server = app.listen(PORT, () => {
-    console.log(`AI Company Research Agent running at http://localhost:${PORT}`);
+  const HOST = process.env.HOST || '0.0.0.0';
+  const server = app.listen(PORT, HOST, () => {
+    const displayHost = HOST === '0.0.0.0' ? 'localhost' : HOST;
+    console.log(`AI Company Research Agent running at http://${displayHost}:${PORT}`);
+    if (HOST !== '0.0.0.0') console.log(`Also at http://localhost:${PORT} (bound to ${HOST})`);
+    else console.log(`Accessible on WiFi at http://10.0.0.10:${PORT} and http://localhost:${PORT}`);
   });
 
   server.on('error', (err) => {
